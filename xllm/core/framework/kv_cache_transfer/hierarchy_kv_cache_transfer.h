@@ -75,7 +75,7 @@ class HierarchyKVCacheTransfer {
                            std::vector<xllm::KVCache>* kv_caches_ptr,
                            const KVCacheShape& kv_cache_shape,
                            const KVCacheCreateOptions& create_options);
-  ~HierarchyKVCacheTransfer() = default;
+  ~HierarchyKVCacheTransfer();
 
   uint32_t transfer_kv_blocks(
       const uint64_t batch_id,

@@ -19,6 +19,7 @@ limitations under the License.
 
 #include "block_manager_pool.h"
 #include "composite_block_manager.h"
+#include "core/framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "distributed_runtime/engine.h"
 #include "util/blockingconcurrentqueue.h"
 
@@ -84,6 +85,10 @@ class HierarchyBlockManagerPool : public BlockManagerPool {
   // owned only by the Sequence's Host/device cache states.
   std::vector<std::vector<BlockTransferInfo>> load_block_transfer_infos_;
   std::vector<OffloadBlockPairQueue> offload_block_pair_queues_;
+
+  // Declared last so destruction waits for callbacks before any manager or
+  // block storage captured by those callbacks is released.
+  KVTransferTracker offload_transfers_;
 };
 
 }  // namespace xllm
