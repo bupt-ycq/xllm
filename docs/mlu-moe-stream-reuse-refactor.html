@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>xLLM MLU MoE Stream 复用重构设计</title>
+  <style>
+    :root {
+      --ink: #16201c;
+      --muted: #66736d;
+      --paper: #f4f1e9;
+      --panel: #fffdf8;
+      --line: #d9d4c8;
+      --green: #176b55;
+      --green-dark: #104b3d;
+      --green-soft: #dcece5;
+      --orange: #cf632f;
+      --orange-soft: #f8e5d9;
+      --blue: #315f83;
+      --blue-soft: #e2edf4;
+      --red: #a8443d;
+      --red-soft: #f4dfdc;
+      --gold: #9a711b;
+      --gold-soft: #f3ead1;
+      --shadow: 0 16px 44px rgba(33, 43, 38, .09);
+      --sans: Inter, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 7% -4%, rgba(49, 95, 131, .13), transparent 28rem),
+        radial-gradient(circle at 97% 9%, rgba(207, 99, 47, .11), transparent 30rem),
+        var(--paper);
+      font-family: var(--sans);
+      line-height: 1.7;
+    }
+    a { color: var(--green); }
+    code, pre { font-family: var(--mono); }
+    code {
+      padding: .12em .38em;
+      border: 1px solid #ddd8cc;
+      border-radius: .35em;
+      background: #f1eee6;
+      font-size: .9em;
+    }
+    pre {
+      overflow: auto;
+      margin: 1rem 0 0;
+      padding: 1.15rem 1.25rem;
+      border: 1px solid #34443d;
+      border-radius: 14px;
+      color: #eaf3ee;
+      background: #1c2823;
+      line-height: 1.55;
+      font-size: .83rem;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+      max-width: 1540px;
+      margin: 0 auto;
+    }
+    aside {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 28px 20px;
+      overflow: auto;
+      border-right: 1px solid rgba(110, 120, 114, .24);
+      background: rgba(244, 241, 233, .88);
+      backdrop-filter: blur(12px);
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      margin-bottom: 25px;
+      font-weight: 780;
+      letter-spacing: -.02em;
+    }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      color: white;
+      background: var(--green);
+      box-shadow: 0 8px 20px rgba(23, 107, 85, .22);
+      font-family: var(--mono);
+      font-size: .78rem;
+    }
+    nav a {
+      display: block;
+      margin: 2px 0;
+      padding: 7px 10px;
+      border-radius: 8px;
+      color: #58655f;
+      text-decoration: none;
+      font-size: .86rem;
+    }
+    nav a:hover { color: var(--ink); background: rgba(255,255,255,.72); }
+    .nav-label {
+      margin: 18px 10px 5px;
+      color: #8a938e;
+      font-size: .68rem;
+      font-weight: 750;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .aside-note {
+      margin-top: 25px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: var(--muted);
+      background: rgba(255,255,255,.58);
+      font-size: .75rem;
+    }
+
+    main {
+      width: 100%;
+      min-width: 0;
+      padding: 48px clamp(24px, 5vw, 76px) 90px;
+    }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      min-height: 430px;
+      padding: clamp(34px, 6vw, 74px);
+      border-radius: 28px;
+      color: white;
+      background: linear-gradient(128deg, #104b3d, #1f3847 77%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      right: -85px;
+      bottom: -130px;
+      width: 410px;
+      height: 410px;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 50%;
+      box-shadow: 0 0 0 50px rgba(255,255,255,.035), 0 0 0 112px rgba(255,255,255,.022);
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 11px;
+      border: 1px solid rgba(255,255,255,.22);
+      border-radius: 999px;
+      background: rgba(255,255,255,.08);
+      font-size: .75rem;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .hero h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 960px;
+      margin: 28px 0 17px;
+      font-size: clamp(2.5rem, 5.8vw, 5.1rem);
+      line-height: 1.04;
+      letter-spacing: -.055em;
+    }
+    .hero .lead {
+      position: relative;
+      z-index: 1;
+      max-width: 850px;
+      color: rgba(255,255,255,.79);
+      font-size: clamp(1rem, 1.8vw, 1.2rem);
+    }
+    .hero-meta {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 22px;
+      margin-top: 38px;
+      color: rgba(255,255,255,.72);
+      font-family: var(--mono);
+      font-size: .77rem;
+    }
+
+    section { margin-top: 72px; scroll-margin-top: 22px; }
+    h2 {
+      margin: 0 0 20px;
+      font-size: clamp(1.65rem, 3vw, 2.45rem);
+      line-height: 1.2;
+      letter-spacing: -.035em;
+    }
+    h3 { margin: 0 0 11px; font-size: 1.08rem; letter-spacing: -.012em; }
+    p { margin: .6rem 0; }
+    ul, ol { padding-left: 1.25rem; }
+    li + li { margin-top: .35rem; }
+    .section-kicker {
+      margin-bottom: 7px;
+      color: var(--orange);
+      font-size: .74rem;
+      font-weight: 780;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    .section-intro { max-width: 940px; margin-top: -8px; color: var(--muted); }
+
+    .verdict {
+      display: grid;
+      grid-template-columns: 190px minmax(0, 1fr);
+      overflow: hidden;
+      border: 1px solid #bfd7cd;
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .verdict-mark {
+      display: grid;
+      place-items: center;
+      min-height: 190px;
+      color: white;
+      background: var(--green);
+      text-align: center;
+    }
+    .verdict-mark strong { display: block; font-size: 3.15rem; line-height: 1; }
+    .verdict-mark span { font-size: .75rem; letter-spacing: .12em; text-transform: uppercase; }
+    .verdict-copy { padding: 30px 34px; }
+    .verdict-copy h3 { font-size: 1.45rem; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-top: 18px;
+    }
+    .metric {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255,253,248,.82);
+    }
+    .metric strong { display: block; color: var(--green); font-size: 1.65rem; line-height: 1.2; }
+    .metric span { color: var(--muted); font-size: .8rem; }
+
+    .compare {
+      display: grid;
+      grid-template-columns: 1fr 70px 1fr;
+      gap: 17px;
+      align-items: stretch;
+    }
+    .diagram-card {
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+      box-shadow: 0 10px 28px rgba(33,43,38,.06);
+    }
+    .diagram-card.bad { border-top: 5px solid var(--orange); }
+    .diagram-card.good { border-top: 5px solid var(--green); }
+    .diagram-card .caption { margin-bottom: 18px; color: var(--muted); font-size: .82rem; }
+    .arrow-center { display: grid; place-items: center; color: var(--green); font-size: 2.4rem; }
+    .flow-stack { display: grid; gap: 10px; }
+    .node {
+      position: relative;
+      padding: 12px 15px;
+      border: 1px solid #cfd8d3;
+      border-radius: 10px;
+      background: #fafcfb;
+      font-family: var(--mono);
+      font-size: .8rem;
+      text-align: center;
+    }
+    .node::after {
+      content: "↓  透传 shared_ptr";
+      position: absolute;
+      left: 50%;
+      bottom: -23px;
+      z-index: 2;
+      padding: 0 5px;
+      color: var(--orange);
+      background: var(--panel);
+      transform: translateX(-50%);
+      font-family: var(--sans);
+      font-size: .68rem;
+      white-space: nowrap;
+    }
+    .node:last-child::after { display: none; }
+    .node.hot { border-color: #e3ac8f; background: var(--orange-soft); }
+    .target-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 12px; align-items: center; }
+    .context-box {
+      padding: 18px;
+      border: 1px solid #a8cbbb;
+      border-radius: 13px;
+      background: var(--green-soft);
+      text-align: center;
+    }
+    .context-box strong { display: block; color: var(--green-dark); }
+    .resource-box { display: grid; gap: 10px; }
+    .resource-box .node::after { display: none; }
+    .resource-box .node { border-color: #9db9cb; background: var(--blue-soft); }
+    .connector { color: var(--green); text-align: center; font-weight: 800; }
+    .small-note { margin-top: 16px; color: var(--muted); font-size: .78rem; }
+
+    .scope-visual {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    .model-scope {
+      padding: 22px;
+      border: 2px solid var(--green);
+      border-radius: 20px;
+      background: rgba(220,236,229,.44);
+    }
+    .model-scope.second { border-color: var(--blue); background: rgba(226,237,244,.55); }
+    .scope-title { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 15px; font-weight: 780; }
+    .pill {
+      padding: 3px 8px;
+      border-radius: 999px;
+      color: var(--green-dark);
+      background: white;
+      font-size: .7rem;
+      font-weight: 720;
+    }
+    .model-scope.second .pill { color: var(--blue); }
+    .factory {
+      padding: 14px;
+      border: 1px dashed currentColor;
+      border-radius: 12px;
+      background: rgba(255,255,255,.74);
+      font-family: var(--mono);
+      font-size: .8rem;
+    }
+    .streams { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 10px; }
+    .stream {
+      padding: 11px 8px;
+      border-radius: 9px;
+      color: white;
+      background: var(--green);
+      text-align: center;
+      font-family: var(--mono);
+      font-size: .7rem;
+    }
+    .second .stream { background: var(--blue); }
+
+    .sequence {
+      overflow-x: auto;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--panel);
+    }
+    .seq-grid {
+      display: grid;
+      grid-template-columns: 135px 1fr 1fr 1fr;
+      min-width: 780px;
+      border-top: 1px solid var(--line);
+      border-left: 1px solid var(--line);
+    }
+    .seq-grid > div {
+      min-height: 78px;
+      padding: 13px;
+      border-right: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+    .seq-head { min-height: auto !important; color: white; background: #263830; font-weight: 720; text-align: center; }
+    .seq-label { color: var(--muted); background: #f6f3eb; font-size: .78rem; font-weight: 720; }
+    .action { position: relative; font-family: var(--mono); font-size: .75rem; }
+    .action.create { color: var(--orange); background: var(--orange-soft); }
+    .action.reuse { color: var(--green-dark); background: var(--green-soft); }
+    .action.none { color: #a0aaa5; background: #faf9f5; }
+
+    .principles, .cards, .migration {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    .card {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      box-shadow: 0 8px 24px rgba(33,43,38,.045);
+    }
+    .card .number {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      margin-bottom: 14px;
+      border-radius: 9px;
+      color: white;
+      background: var(--green);
+      font-family: var(--mono);
+      font-size: .77rem;
+    }
+    .card.warn .number { background: var(--orange); }
+    .card p { color: var(--muted); font-size: .88rem; }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      font-size: .86rem;
+    }
+    th, td { padding: 13px 15px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--green-dark); background: #edf4f0; font-size: .76rem; letter-spacing: .04em; }
+    tr:last-child td { border-bottom: 0; }
+    .yes { color: var(--green); font-weight: 760; }
+    .no { color: var(--red); font-weight: 760; }
+
+    .callout {
+      margin-top: 20px;
+      padding: 19px 22px;
+      border-left: 5px solid var(--gold);
+      border-radius: 0 13px 13px 0;
+      background: var(--gold-soft);
+    }
+    .callout.danger { border-color: var(--red); background: var(--red-soft); }
+    .callout strong { display: block; margin-bottom: 4px; }
+
+    .footer {
+      margin-top: 80px;
+      padding-top: 22px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .78rem;
+    }
+
+    @media (max-width: 1050px) {
+      .layout { grid-template-columns: 1fr; }
+      aside { position: static; width: 100%; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      aside nav { display: flex; flex-wrap: wrap; gap: 4px; }
+      .nav-label, .aside-note { display: none; }
+      .compare { grid-template-columns: 1fr; }
+      .arrow-center { transform: rotate(90deg); }
+      .metrics, .principles, .cards, .migration { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 680px) {
+      main { padding: 24px 16px 60px; }
+      .hero { min-height: auto; border-radius: 20px; }
+      .verdict { grid-template-columns: 1fr; }
+      .verdict-mark { min-height: 120px; }
+      .metrics, .principles, .cards, .migration, .scope-visual, .target-grid { grid-template-columns: 1fr; }
+      .streams { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <div class="brand"><div class="brand-mark">MoE</div><span>Stream Refactor</span></div>
+      <nav>
+        <div class="nav-label">Decision</div>
+        <a href="#summary">结论摘要</a>
+        <a href="#problem">现状与问题</a>
+        <a href="#architecture">目标架构</a>
+        <div class="nav-label">Design</div>
+        <a href="#scope">生命周期与隔离</a>
+        <a href="#sequence">创建与复用时序</a>
+        <a href="#api">建议接口</a>
+        <a href="#alternatives">方案对比</a>
+        <div class="nav-label">Delivery</div>
+        <a href="#migration">迁移计划</a>
+        <a href="#tests">验证矩阵</a>
+        <a href="#risks">风险与边界</a>
+      </nav>
+      <div class="aside-note">
+        分析基线：<code>origin/main..bugfix/mlu-moe-stream-reuse</code><br>
+        核心原则：每个模型构建一次，而非整个进程构建一次。
+      </div>
+    </aside>
+
+    <main>
+      <header class="hero">
+        <div class="eyebrow">xLLM · MLU · Architecture Decision</div>
+        <h1>让 MoE 自己获取<br>模型级 Stream</h1>
+        <p class="lead">
+          用强类型、模型作用域、按角色惰性初始化的 <code>ModelStreamRegistry</code> 替代
+          <code>shared_ptr&lt;FusedMoEStreams&gt;</code> 从模型到算子的层层透传。它不仅服务 MoE，也能承载未来 Attention 的通算并行 stream。
+        </p>
+        <div class="hero-meta">
+          <span>STATUS: FEASIBLE</span>
+          <span>SCOPE: MODEL INSTANCE</span>
+          <span>INIT: LAZY + THREAD-SAFE</span>
+          <span>GLOBAL SINGLETON: REJECTED</span>
+        </div>
+      </header>
+
+      <section id="summary">
+        <div class="section-kicker">Executive decision</div>
+        <h2>结论摘要</h2>
+        <div class="verdict">
+          <div class="verdict-mark"><div><strong>YES</strong><span>可行，建议推进</span></div></div>
+          <div class="verdict-copy">
+            <h3>采用 ModelStreamRegistry，作用域绑定模型实例</h3>
+            <p>
+              registry 由 <code>ModelContext</code> 共享持有，组件按照执行角色调用 <code>get()</code>。
+              每个角色第一次被请求时创建 stream，后续返回同一实例；独立模型之间互不共享。
+            </p>
+            <p>
+              这能删除当前 <code>MoEDecoderLayerFactory</code> 以及模型、MTP、decoder layer 中仅用于传递 stream 的构造参数和 lambda。
+            </p>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="metric"><strong>1×</strong><span>每个模型、每个角色创建一条稳定 stream</span></div>
+          <div class="metric"><strong>Role</strong><span>COMMUNICATION / AUXILIARY_COMPUTE</span></div>
+          <div class="metric"><strong>0</strong><span>模型层需要感知的组件专属 stream 参数</span></div>
+          <div class="metric"><strong>Lazy</strong><span>未使用的角色不创建 stream</span></div>
+        </div>
+      </section>
+
+      <section id="problem">
+        <div class="section-kicker">Current state</div>
+        <h2>现状正确，但资源透传链过长</h2>
+        <p class="section-intro">
+          当前分支已经修复“每层重复从 stream pool 获取导致复用/别名风险”的问题，并通过模型工厂确保同模型共享、不同模型隔离。
+          主要成本不是运行时，而是构造 API 和跨层依赖扩散。
+        </p>
+        <div class="compare">
+          <div class="diagram-card bad">
+            <h3>Before · 显式注入</h3>
+            <div class="caption">资源所有权清晰，但每一层都被迫理解并转发 MLU MoE 细节。</div>
+            <div class="flow-stack">
+              <div class="node hot">Model / MTP Model</div>
+              <div class="node hot">MoEDecoderLayerFactory</div>
+              <div class="node hot">DecoderLayer constructor</div>
+              <div class="node hot">SparseMoEBlock constructor</div>
+              <div class="node">FusedMoEImpl</div>
+            </div>
+            <div class="small-note">影响面：模型模板、MLU decoder、MTP factory、测试 fixture 和多个构造签名。</div>
+          </div>
+          <div class="arrow-center">➜</div>
+          <div class="diagram-card good">
+            <h3>After · 模型级资源获取</h3>
+            <div class="caption">上层只传已有的 ModelContext；MoE 在实际需要资源的位置获取。</div>
+            <div class="target-grid">
+              <div class="context-box">
+                <strong>ModelContext</strong>
+                shared model scope<br>
+                <span class="connector">↕</span><br>
+                <code>ModelStreamRegistry</code>
+              </div>
+              <div class="resource-box">
+                <div class="node">DecoderLayer(context, id)</div>
+                <div class="connector">↓ context</div>
+                <div class="node">MoE / Attention calls get(role)</div>
+                <div class="connector">↓ stable stream per role</div>
+                <div class="node">Execution component</div>
+              </div>
+            </div>
+            <div class="small-note">模型层恢复原有构造方式；stream 生命周期仍与模型一致。</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <div class="section-kicker">Target architecture</div>
+        <h2>目标架构：按执行角色注册模型级 stream</h2>
+        <div class="principles">
+          <div class="card">
+            <div class="number">01</div>
+            <h3>模型作用域</h3>
+            <p>每个根 <code>ModelContext</code> 创建一个 registry。context 的普通复制及派生 context 共享该 registry。</p>
+          </div>
+          <div class="card">
+            <div class="number">02</div>
+            <h3>惰性初始化</h3>
+            <p>仅角色第一次被组件请求时创建 stream；没有使用该并行角色的模型不会创建额外资源。</p>
+          </div>
+          <div class="card">
+            <div class="number">03</div>
+            <h3>强类型接口</h3>
+            <p>使用 <code>ExecutionStreamRole</code>，不使用字符串 key 或组件名称；MoE 与 Attention 共享同一种语言。</p>
+          </div>
+          <div class="card">
+            <div class="number">04</div>
+            <h3>线程安全</h3>
+            <p><code>get(role)</code> 使用锁保护，保证并发构建层时每个角色也只产生一条 stream。</p>
+          </div>
+          <div class="card">
+            <div class="number">05</div>
+            <h3>设备一致</h3>
+            <p>registry 构造时绑定 device，调用方只提供 role，从接口上消除跨设备误取的可能。</p>
+          </div>
+          <div class="card">
+            <div class="number">06</div>
+            <h3>RAII 销毁</h3>
+            <p>context/registry/stream 的 shared ownership 链随模型释放，无进程级缓存、无悬挂 key、无额外清理 API。</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="scope">
+        <div class="section-kicker">Ownership boundary</div>
+        <h2>生命周期与隔离边界</h2>
+        <p class="section-intro">“只构建一次”的精确定义是：每个模型实例、每个运行进程/rank 内，每个执行角色只构建一条 stream。</p>
+        <div class="scope-visual">
+          <div class="model-scope">
+            <div class="scope-title"><span>Model A · device 0</span><span class="pill">own scope</span></div>
+            <div class="factory">ModelContext A<br>└─ shared_ptr&lt;ModelStreamRegistry A&gt;</div>
+            <div class="streams">
+              <div class="stream">COMMUNICATION A</div>
+              <div class="stream">AUX_COMPUTE A</div>
+            </div>
+          </div>
+          <div class="model-scope second">
+            <div class="scope-title"><span>Model B · device 0</span><span class="pill">isolated</span></div>
+            <div class="factory">ModelContext B<br>└─ shared_ptr&lt;ModelStreamRegistry B&gt;</div>
+            <div class="streams">
+              <div class="stream">COMMUNICATION B</div>
+              <div class="stream">AUX_COMPUTE B</div>
+            </div>
+          </div>
+        </div>
+        <div class="callout danger">
+          <strong>禁止按 device 做全局 singleton</strong>
+          Model A 和 Model B 即使位于同一 MLU device，也不应共享 registry 或 stream。否则会引入跨模型串行化、graph capture 相互影响、生命周期延长和并发语义模糊。
+        </div>
+      </section>
+
+      <section id="sequence">
+        <div class="section-kicker">Runtime sequence</div>
+        <h2>第一次创建，后续稳定复用</h2>
+        <div class="sequence">
+          <div class="seq-grid">
+            <div class="seq-head">阶段</div>
+            <div class="seq-head">MoE Layer 0</div>
+            <div class="seq-head">MoE Layer 1</div>
+            <div class="seq-head">MoE Layer N</div>
+
+            <div class="seq-label">① 请求</div>
+            <div class="action">registry.get(COMMUNICATION)<br>registry.get(AUXILIARY_COMPUTE)</div>
+            <div class="action none">尚未构建</div>
+            <div class="action none">尚未构建</div>
+
+            <div class="seq-label">② 初始化</div>
+            <div class="action create">lock → create missing roles<br>publish stable streams</div>
+            <div class="action none">—</div>
+            <div class="action none">—</div>
+
+            <div class="seq-label">③ 后续请求</div>
+            <div class="action reuse">持有角色 stream</div>
+            <div class="action reuse">同 role 返回同一 stream</div>
+            <div class="action reuse">同 role 返回同一 stream</div>
+
+            <div class="seq-label">④ 模型销毁</div>
+            <div class="action">release shared_ptr</div>
+            <div class="action">release shared_ptr</div>
+            <div class="action">最后引用释放 → registry/streams RAII 销毁</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="api">
+        <div class="section-kicker">Suggested API</div>
+        <h2>建议接口草案</h2>
+        <p class="section-intro">
+          类型可以放在 framework/platform 可接受的低层位置，避免通用 framework 反向依赖具体 <code>FusedMoE</code> 或 Attention 实现。
+          registry 构造时绑定模型 device，角色使用强类型枚举，名称需遵守项目 RULES.md 的函数下划线数量约束。
+        </p>
+        <pre><span style="color:#91c7b0">enum class</span> ExecutionStreamRole : int8_t {
+  COMMUNICATION,
+  AUXILIARY_COMPUTE,
+};
+
+<span style="color:#91c7b0">class</span> ModelStreamRegistry final {
+ public:
+  explicit ModelStreamRegistry(const torch::Device&amp; device);
+
+  std::shared_ptr&lt;Stream&gt; get(ExecutionStreamRole role);
+
+ private:
+  torch::Device device_;
+  std::mutex mutex_;
+  std::unordered_map&lt;ExecutionStreamRole,
+                     std::shared_ptr&lt;Stream&gt;&gt; streams_;
+};
+
+<span style="color:#91c7b0">class</span> ModelContext {
+ public:
+  const std::shared_ptr&lt;ModelStreamRegistry&gt;&amp; stream_registry() const;
+
+ private:
+  std::shared_ptr&lt;ModelStreamRegistry&gt; stream_registry_;
+};</pre>
+        <p>MoE 和 Attention 按执行语义获取，而不是按组件名获取：</p>
+        <pre>const auto&amp; registry = context.stream_registry();
+const auto&amp; comm_stream =
+    registry-&gt;get(ExecutionStreamRole::COMMUNICATION);
+const auto&amp; aux_compute_stream =
+    registry-&gt;get(ExecutionStreamRole::AUXILIARY_COMPUTE);
+
+sparse_moe_ = register_module(
+    "mlp",
+    SparseMoEBlock(model_args,
+                   quant_args,
+                   parallel_args,
+                   options,
+                   comm_stream,
+                   aux_compute_stream));
+
+// Attention SP can reuse the same communication role when its schedule
+// guarantees that it does not need to overlap with another role consumer.
+const auto&amp; sp_comm_stream =
+    registry-&gt;get(ExecutionStreamRole::COMMUNICATION);</pre>
+        <div class="callout">
+          <strong>共享 registry 不等于强制共享物理 stream</strong>
+          MoE routed communication 与 Attention SP communication 只有在调度上不会同时执行时，才共同使用 <code>COMMUNICATION</code>。
+          如果未来确实需要并发，应增加新的语义角色，而不是用 <code>MOE_*</code>/<code>ATTENTION_*</code> 组件名称提前固化边界。
+        </div>
+      </section>
+
+      <section id="alternatives">
+        <div class="section-kicker">Trade-off</div>
+        <h2>方案对比</h2>
+        <table>
+          <thead>
+            <tr><th>方案</th><th>模型隔离</th><th>调用侧复杂度</th><th>生命周期</th><th>评价</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>当前 <code>MoEDecoderLayerFactory</code> + 显式注入</td>
+              <td class="yes">正确</td><td>高，跨多层透传</td><td class="yes">清晰</td><td>功能正确，但代码面偏大</td>
+            </tr>
+            <tr>
+              <td>通用 <code>ModelResourceRegistry</code></td>
+              <td class="yes">正确</td><td>低</td><td class="yes">清晰</td><td>已在早期提交验证过，但字符串 key/type erasure 对单一资源偏重</td>
+            </tr>
+            <tr>
+              <td><strong>模型级 <code>ModelStreamRegistry</code> + role</strong></td>
+              <td class="yes">正确</td><td class="yes">最低</td><td class="yes">清晰</td><td class="yes">推荐：可跨 MoE/Attention 复用且语义明确</td>
+            </tr>
+            <tr>
+              <td>进程级 / device 级 singleton</td>
+              <td class="no">错误</td><td>低</td><td class="no">全局驻留</td><td class="no">拒绝：改变跨模型并发和 capture 语义</td>
+            </tr>
+            <tr>
+              <td>每个 MoE 层自行从 pool 获取</td>
+              <td>不适用</td><td>低</td><td class="no">每层一份</td><td class="no">拒绝：回到本分支要修复的问题</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="migration">
+        <div class="section-kicker">Migration plan</div>
+        <h2>建议分三步迁移</h2>
+        <div class="migration">
+          <div class="card">
+            <div class="number">1</div>
+            <h3>建立资源边界</h3>
+            <p>新增强类型 registry 和 role；由根 ModelContext 创建，确保 copy、<code>with_parallel_args()</code> 和 <code>with_quant_args()</code> 共享。</p>
+          </div>
+          <div class="card">
+            <div class="number">2</div>
+            <h3>下沉获取位置</h3>
+            <p>让实际构建 MoE 的 decoder/sparse block 按角色获取 stream；先保持 <code>FusedMoEImpl</code> 对两条 stream 的显式依赖。</p>
+          </div>
+          <div class="card">
+            <div class="number">3</div>
+            <h3>删除传播脚手架</h3>
+            <p>删除 MoEDecoderLayerFactory、模型层 lambda、MTP 中只为 stream 增加的 factory overload，以及相应构造参数。</p>
+          </div>
+        </div>
+        <h3 style="margin-top:26px">预期主要文件变化</h3>
+        <table>
+          <thead><tr><th>区域</th><th>动作</th><th>目标</th></tr></thead>
+          <tbody>
+            <tr><td><code>core/framework/model_context.*</code></td><td>新增/共享模型级 registry</td><td>定义所有权和派生 context 语义</td></tr>
+            <tr><td><code>core/platform</code> 或独立低层资源文件</td><td>新增 ModelStreamRegistry / ExecutionStreamRole</td><td>避免依赖具体 MoE 或 Attention</td></tr>
+            <tr><td><code>core/layers/mlu/*decoder*</code></td><td>在组件构建点调用 <code>get(role)</code></td><td>停止从模型层注入</td></tr>
+            <tr><td><code>models/llm</code>、<code>models/vlm</code>、MTP</td><td>恢复普通 decoder 构建</td><td>删除 backend-specific 传播逻辑</td></tr>
+            <tr><td><code>core/layers/moe_decoder_layer_factory.h</code></td><td>删除</td><td>移除现有脚手架</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="tests">
+        <div class="section-kicker">Verification</div>
+        <h2>验证矩阵</h2>
+        <table>
+          <thead><tr><th>场景</th><th>断言</th><th>优先级</th></tr></thead>
+          <tbody>
+            <tr><td>同一 context 对同一 role 连续调用 get</td><td>返回同一 stream 地址</td><td>必须</td></tr>
+            <tr><td>同一 context 请求两个不同 role</td><td>返回两条不同 stream</td><td>必须</td></tr>
+            <tr><td>同一模型的多个 MoE 层</td><td>相同 role 的 stream 指针一致</td><td>必须</td></tr>
+            <tr><td>MoE 与 Attention 请求相同 role</td><td>在允许物理复用的调度下获得同一 stream</td><td>必须</td></tr>
+            <tr><td>两个独立根 ModelContext</td><td>registry 与角色 stream 均不同</td><td>必须</td></tr>
+            <tr><td>复制 context / 派生 parallel、quant context</td><td>共享同一 registry 和角色 stream</td><td>必须</td></tr>
+            <tr><td>多线程并发首次 get(role)</td><td>该 role 只创建一次，所有调用获得同一 stream</td><td>必须</td></tr>
+            <tr><td>只请求 COMMUNICATION</td><td>AUXILIARY_COMPUTE 保持未创建</td><td>建议</td></tr>
+            <tr><td>模型销毁后重建</td><td>旧 registry 释放，新模型获得新 stream</td><td>建议</td></tr>
+            <tr><td>MLU MoE 既有精度/通信测试</td><td>结果和同步关系无回归</td><td>必须</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="risks">
+        <div class="section-kicker">Guardrails</div>
+        <h2>风险与设计边界</h2>
+        <div class="cards">
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>Context 派生丢失 registry</h3>
+            <p>当前 <code>with_parallel_args()</code>/<code>with_quant_args()</code> 会构造新 context；必须显式复制 registry，或重构为天然共享的 model scope state。</p>
+          </div>
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>层次依赖反转</h3>
+            <p>不要让 framework header include <code>layers/mlu/fused_moe.h</code> 或 Attention header。registry 和 role 应位于 platform/framework 可接受的低层位置。</p>
+          </div>
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>锁覆盖创建过程</h3>
+            <p>需要保证只发布完整构造的 stream。角色获取只发生在 layer 初始化而非 forward 热路径，简单互斥锁已经足够；返回 shared_ptr 值可避免容器扩容导致引用失效。</p>
+          </div>
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>Graph capture</h3>
+            <p>stream 必须在模型/层初始化阶段确定，不能在首次 forward 或 capture 中才创建；lazy 指“首次组件构建时请求角色”，不是“首次执行”。</p>
+          </div>
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>MTP 作用域</h3>
+            <p>需要确认 target model 与独立 draft/MTP model 是否应视作不同模型实例；默认建议各自拥有 registry，除非生命周期明确属于同一模型对象。</p>
+          </div>
+          <div class="card warn">
+            <div class="number">!</div>
+            <h3>角色不能等同组件</h3>
+            <p>优先使用 COMMUNICATION / AUXILIARY_COMPUTE 等执行语义。只有确有并发冲突时才拆分新角色，避免退化为 MOE_* / ATTENTION_* 名称列表。</p>
+          </div>
+        </div>
+        <div class="callout">
+          <strong>历史证据</strong>
+          本分支提交 <code>c800fb20</code> 曾通过通用 <code>ModelResourceRegistry</code> 实现 <code>FusedMoEStreams::get_or_create(context)</code>，说明“组件从 context 获取模型级资源”的路径已被代码验证。新方案把 registry 收窄到模型执行 stream，并以强类型 role 替代字符串 key/type erasure。
+        </div>
+      </section>
+
+      <section>
+        <div class="section-kicker">Final recommendation</div>
+        <h2>最终建议</h2>
+        <div class="verdict-copy" style="border:1px solid #bfd7cd;border-radius:18px;background:var(--panel);box-shadow:var(--shadow)">
+          <h3>推进 ModelStreamRegistry；按执行角色跨 MoE 与 Attention 复用</h3>
+          <ol>
+            <li>保证 registry 是 <strong>per model instance</strong>，不是 per process 或 per device。</li>
+            <li>构造时绑定 device，在 layer 初始化阶段按 role lazy create。</li>
+            <li>ModelContext 的所有派生副本共享同一 registry。</li>
+            <li>第一阶段保留 FusedMoEImpl 显式接收两条角色 stream，控制重构范围。</li>
+            <li>相同 role 是否复用物理 stream 必须由调度互斥关系决定，而不是由组件名称决定。</li>
+          </ol>
+        </div>
+      </section>
+
+      <footer class="footer">
+        xLLM MLU MoE Stream Reuse Refactor · 设计分析文档 · 2026-08-24
+      </footer>
+    </main>
+  </div>
+</body>
+</html>

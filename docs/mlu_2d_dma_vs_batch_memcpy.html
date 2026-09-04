@@ -1,0 +1,860 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="用多张图解释 MLU cnMemcpy2DAsync 与 cnMemcpyBatchAsync 的区别，以及 xLLM KV Cache copy 的分流策略。"
+    />
+    <title>2D DMA vs Batch Memcpy｜xLLM MLU KV Cache 图解</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #eef6f3;
+        --muted: #9aaca7;
+        --paper: #07100e;
+        --panel: #0d1b17;
+        --panel-2: #11231e;
+        --line: rgba(191, 225, 214, 0.15);
+        --green: #65f2b1;
+        --green-deep: #18b977;
+        --cyan: #63d7ff;
+        --blue: #7ba7ff;
+        --yellow: #ffd166;
+        --orange: #ff9d66;
+        --pink: #ff7fad;
+        --red: #ff6e77;
+        --purple: #bda3ff;
+        --shadow: 0 28px 80px rgba(0, 0, 0, 0.34);
+        --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      }
+
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        min-width: 320px;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 8% 4%, rgba(101, 242, 177, 0.14), transparent 28rem),
+          radial-gradient(circle at 93% 13%, rgba(99, 215, 255, 0.12), transparent 30rem),
+          linear-gradient(180deg, #07100e, #091713 52%, #07100e);
+        font-family: var(--sans);
+        line-height: 1.68;
+      }
+      body::before {
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        content: "";
+        opacity: 0.16;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        background-size: 42px 42px;
+        mask-image: linear-gradient(to bottom, black, transparent 80%);
+      }
+      a { color: var(--green); }
+      code, pre { font-family: var(--mono); }
+      code {
+        padding: 0.12em 0.38em;
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        border-radius: 0.38em;
+        color: #dff9ed;
+        background: rgba(255, 255, 255, 0.055);
+        font-size: 0.9em;
+      }
+      .shell { width: min(1180px, calc(100% - 36px)); margin: 0 auto; }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 20;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+        background: rgba(7, 16, 14, 0.78);
+        backdrop-filter: blur(18px);
+      }
+      .topbar .shell {
+        display: flex;
+        gap: 18px;
+        align-items: center;
+        min-height: 58px;
+      }
+      .brand {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-right: auto;
+        color: var(--ink);
+        font-weight: 820;
+        text-decoration: none;
+        letter-spacing: -0.025em;
+      }
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 34px;
+        height: 34px;
+        border-radius: 10px;
+        color: #032117;
+        background: var(--green);
+        font-family: var(--mono);
+        font-size: 11px;
+        box-shadow: 0 8px 22px rgba(101, 242, 177, 0.2);
+      }
+      nav { display: flex; gap: 4px; }
+      nav a {
+        padding: 6px 9px;
+        border-radius: 8px;
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 13px;
+      }
+      nav a:hover { color: var(--ink); background: rgba(255, 255, 255, 0.055); }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.03fr) minmax(360px, 0.97fr);
+        gap: 46px;
+        align-items: center;
+        min-height: 86vh;
+        padding: 78px 0 62px;
+      }
+      .eyebrow {
+        display: inline-flex;
+        gap: 9px;
+        align-items: center;
+        margin-bottom: 22px;
+        color: var(--green);
+        font-size: 12px;
+        font-weight: 780;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .eyebrow::before { width: 28px; height: 1px; content: ""; background: var(--green); }
+      h1, h2, h3, p { margin-top: 0; }
+      h1 {
+        margin-bottom: 24px;
+        font-size: clamp(44px, 6.5vw, 78px);
+        line-height: 1.02;
+        letter-spacing: -0.058em;
+      }
+      h1 em { color: var(--yellow); font-style: normal; }
+      .lead {
+        max-width: 720px;
+        margin-bottom: 30px;
+        color: #bfd0ca;
+        font-size: clamp(17px, 2vw, 21px);
+      }
+      .answer-line {
+        display: flex;
+        gap: 11px;
+        align-items: flex-start;
+        padding: 16px 18px;
+        border: 1px solid rgba(101, 242, 177, 0.2);
+        border-radius: 16px;
+        background: rgba(101, 242, 177, 0.065);
+      }
+      .answer-line strong { color: var(--green); }
+      .answer-line p { margin: 0; }
+      .dot {
+        flex: 0 0 auto;
+        width: 9px;
+        height: 9px;
+        margin-top: 8px;
+        border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 0 6px rgba(101, 242, 177, 0.1);
+      }
+
+      .hero-visual {
+        position: relative;
+        overflow: hidden;
+        padding: 22px;
+        border: 1px solid rgba(101, 242, 177, 0.18);
+        border-radius: 28px;
+        background: linear-gradient(145deg, rgba(19, 43, 36, 0.94), rgba(9, 21, 18, 0.96));
+        box-shadow: var(--shadow);
+      }
+      .hero-visual::after {
+        position: absolute;
+        right: -80px;
+        bottom: -100px;
+        width: 260px;
+        height: 260px;
+        border: 1px solid rgba(101, 242, 177, 0.16);
+        border-radius: 50%;
+        content: "";
+        box-shadow: 0 0 0 42px rgba(101, 242, 177, 0.025), 0 0 0 84px rgba(101, 242, 177, 0.018);
+      }
+      .visual-title {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 15px;
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      svg { display: block; width: 100%; height: auto; }
+
+      main { padding-bottom: 100px; }
+      section { padding: 62px 0; scroll-margin-top: 68px; }
+      .section-head {
+        display: grid;
+        grid-template-columns: minmax(250px, 0.78fr) minmax(0, 1.22fr);
+        gap: 42px;
+        align-items: end;
+        margin-bottom: 30px;
+      }
+      .kicker {
+        margin-bottom: 11px;
+        color: var(--cyan);
+        font-family: var(--mono);
+        font-size: 12px;
+        letter-spacing: 0.09em;
+      }
+      h2 {
+        margin-bottom: 0;
+        font-size: clamp(30px, 4vw, 48px);
+        line-height: 1.08;
+        letter-spacing: -0.04em;
+      }
+      .section-head > p { margin: 0; color: #afc0ba; font-size: 17px; }
+      h3 { margin-bottom: 10px; font-size: 20px; letter-spacing: -0.02em; }
+
+      .panel {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 24px;
+        background: linear-gradient(145deg, rgba(17, 35, 30, 0.92), rgba(10, 23, 19, 0.94));
+        box-shadow: 0 18px 60px rgba(0, 0, 0, 0.18);
+      }
+      .panel-pad { padding: clamp(20px, 4vw, 38px); }
+      .figure-caption {
+        display: flex;
+        gap: 14px;
+        justify-content: space-between;
+        align-items: flex-start;
+        padding: 16px 20px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        background: rgba(0, 0, 0, 0.11);
+        font-size: 13px;
+      }
+      .figure-caption strong { color: var(--ink); }
+      .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 22px; }
+      .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+      .card {
+        padding: 23px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.025);
+      }
+      .card p:last-child { margin-bottom: 0; }
+      .card p { color: var(--muted); }
+      .card.batch { border-top: 3px solid var(--orange); }
+      .card.twod { border-top: 3px solid var(--green); }
+      .metric {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin: 15px 0 8px;
+      }
+      .metric strong { color: var(--green); font-size: 38px; letter-spacing: -0.04em; }
+      .metric span { color: var(--muted); font-size: 13px; }
+
+      .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 0 0 18px; }
+      .legend span { display: inline-flex; gap: 7px; align-items: center; color: var(--muted); font-size: 12px; }
+      .legend i { width: 9px; height: 9px; border-radius: 3px; }
+
+      .tabs { display: flex; flex-wrap: wrap; gap: 9px; margin-bottom: 20px; }
+      .tabs button {
+        padding: 9px 14px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.025);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .tabs button:hover { color: var(--ink); border-color: rgba(101, 242, 177, 0.35); }
+      .tabs button.active { border-color: transparent; color: #042016; background: var(--green); font-weight: 760; }
+      .demo-view { display: none; }
+      .demo-view.active { display: block; animation: rise 180ms ease-out; }
+      @keyframes rise { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+
+      .callout {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 14px;
+        align-items: start;
+        padding: 18px 20px;
+        border: 1px solid rgba(255, 209, 102, 0.2);
+        border-radius: 16px;
+        color: #d9d1b9;
+        background: rgba(255, 209, 102, 0.06);
+      }
+      .callout .badge {
+        padding: 3px 8px;
+        border-radius: 999px;
+        color: #2a2104;
+        background: var(--yellow);
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .callout p { margin: 0; }
+
+      pre {
+        overflow: auto;
+        margin: 0;
+        padding: 24px;
+        border: 1px solid #233a32;
+        border-radius: 18px;
+        color: #dce9e4;
+        background: #07110e;
+        line-height: 1.62;
+        font-size: 13px;
+      }
+      .kw { color: var(--purple); }
+      .fn { color: var(--cyan); }
+      .str { color: var(--yellow); }
+      .cm { color: #667a73; }
+
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 15px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+      th { color: var(--muted); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; }
+      td:first-child { color: var(--ink); font-weight: 720; }
+      tr:last-child td { border-bottom: 0; }
+      .yes { color: var(--green); }
+      .maybe { color: var(--yellow); }
+
+      .takeaway {
+        display: grid;
+        grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+        gap: 30px;
+        padding: clamp(28px, 5vw, 52px);
+        border: 1px solid rgba(101, 242, 177, 0.24);
+        border-radius: 28px;
+        background: linear-gradient(135deg, rgba(18, 53, 41, 0.96), rgba(12, 29, 25, 0.98));
+        box-shadow: var(--shadow);
+      }
+      .takeaway .big {
+        color: var(--green);
+        font-size: clamp(34px, 5vw, 62px);
+        font-weight: 860;
+        line-height: 1;
+        letter-spacing: -0.055em;
+      }
+      .takeaway ul { margin: 0; padding-left: 1.25em; color: #c2d2cd; }
+      .takeaway li + li { margin-top: 9px; }
+      footer { padding: 34px 0 54px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+
+      @media (max-width: 900px) {
+        .hero, .section-head, .takeaway { grid-template-columns: 1fr; }
+        .hero { padding-top: 54px; }
+        .grid-3 { grid-template-columns: 1fr; }
+        nav a:nth-child(-n + 3) { display: none; }
+      }
+      @media (max-width: 680px) {
+        .grid-2 { grid-template-columns: 1fr; }
+        .hero { min-height: auto; }
+        .hero-visual { padding: 13px; border-radius: 20px; }
+        section { padding: 46px 0; }
+        th, td { padding: 12px 10px; font-size: 13px; }
+        .figure-caption { display: block; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="shell">
+        <a class="brand" href="#top"><span class="brand-mark">DMA</span>MLU Copy Lab</a>
+        <nav aria-label="页面导航">
+          <a href="#dma">DMA 是什么</a>
+          <a href="#batch">Batch</a>
+          <a href="#twod">2D DMA</a>
+          <a href="#dispatch">分流</a>
+          <a href="#code">代码</a>
+        </nav>
+      </div>
+    </header>
+
+    <div id="top" class="shell">
+      <section class="hero">
+        <div>
+          <div class="eyebrow">xLLM · MLU · KV Cache Transfer</div>
+          <h1>2D DMA 和<br /><em>Batch Memcpy</em><br />到底差在哪？</h1>
+          <p class="lead">
+            两者都能“一次 API 调用复制多段数据”，但给 DMA 引擎的任务描述完全不同：
+            Batch 提交一张任务清单，2D DMA 提交一条固定步长公式。
+          </p>
+          <div class="answer-line">
+            <span class="dot"></span>
+            <p><strong>一句话答案：</strong>地址越规则，越适合 2D DMA；地址越随机，越需要 Batch Memcpy。</p>
+          </div>
+        </div>
+
+        <figure class="hero-visual">
+          <div class="visual-title"><span>同样复制 4 行</span><span>descriptor 对比</span></div>
+          <svg viewBox="0 0 620 520" role="img" aria-label="Batch Memcpy 与 2D DMA descriptor 数量对比">
+            <defs>
+              <linearGradient id="heroBatch" x1="0" x2="1"><stop stop-color="#ff9d66" /><stop offset="1" stop-color="#ff6e77" /></linearGradient>
+              <linearGradient id="hero2d" x1="0" x2="1"><stop stop-color="#65f2b1" /><stop offset="1" stop-color="#63d7ff" /></linearGradient>
+              <filter id="glow"><feGaussianBlur stdDeviation="5" result="b" /><feMerge><feMergeNode in="b" /><feMergeNode in="SourceGraphic" /></feMerge></filter>
+              <marker id="arrowHero" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#8aa39b" /></marker>
+            </defs>
+            <rect x="18" y="16" width="584" height="222" rx="22" fill="#0b1814" stroke="#31453e" />
+            <text x="42" y="52" fill="#ffb38a" font-size="18" font-weight="700">Batch Memcpy</text>
+            <text x="470" y="52" fill="#9aaca7" font-size="13">4 descriptors</text>
+            <g font-family="monospace" font-size="12">
+              <rect x="42" y="76" width="220" height="30" rx="8" fill="url(#heroBatch)" opacity=".9" /><text x="55" y="96" fill="#29120a">src[0] → dst[0], 64B</text>
+              <rect x="42" y="112" width="220" height="30" rx="8" fill="url(#heroBatch)" opacity=".78" /><text x="55" y="132" fill="#29120a">src[1] → dst[1], 64B</text>
+              <rect x="42" y="148" width="220" height="30" rx="8" fill="url(#heroBatch)" opacity=".66" /><text x="55" y="168" fill="#29120a">src[2] → dst[2], 64B</text>
+              <rect x="42" y="184" width="220" height="30" rx="8" fill="url(#heroBatch)" opacity=".54" /><text x="55" y="204" fill="#29120a">src[3] → dst[3], 64B</text>
+            </g>
+            <path d="M280 145H360" stroke="#8aa39b" stroke-width="2" marker-end="url(#arrowHero)" />
+            <rect x="380" y="91" width="174" height="110" rx="18" fill="#15241f" stroke="#ff9d66" stroke-opacity=".55" />
+            <text x="467" y="134" text-anchor="middle" fill="#eef6f3" font-size="17" font-weight="750">DMA Engine</text>
+            <text x="467" y="160" text-anchor="middle" fill="#9aaca7" font-size="12">读取 4 条任务</text>
+            <text x="467" y="179" text-anchor="middle" fill="#9aaca7" font-size="12">逐条处理地址</text>
+
+            <rect x="18" y="262" width="584" height="240" rx="22" fill="#0b1814" stroke="#31453e" />
+            <text x="42" y="300" fill="#65f2b1" font-size="18" font-weight="700">2D DMA</text>
+            <text x="478" y="300" fill="#9aaca7" font-size="13">1 descriptor</text>
+            <rect x="42" y="325" width="256" height="132" rx="16" fill="url(#hero2d)" opacity=".9" filter="url(#glow)" />
+            <g fill="#052119" font-family="monospace" font-size="13">
+              <text x="63" y="354">width      = 64 B</text>
+              <text x="63" y="380">height     = 4</text>
+              <text x="63" y="406">src_pitch  = 300 B</text>
+              <text x="63" y="432">dst_pitch  = 500 B</text>
+            </g>
+            <path d="M316 390H360" stroke="#8aa39b" stroke-width="2" marker-end="url(#arrowHero)" />
+            <rect x="380" y="335" width="174" height="110" rx="18" fill="#15241f" stroke="#65f2b1" stroke-opacity=".65" />
+            <text x="467" y="378" text-anchor="middle" fill="#eef6f3" font-size="17" font-weight="750">DMA Engine</text>
+            <text x="467" y="404" text-anchor="middle" fill="#9aaca7" font-size="12">按公式生成 4 行</text>
+            <text x="467" y="423" text-anchor="middle" fill="#9aaca7" font-size="12">无需地址清单</text>
+          </svg>
+          <figcaption class="figure-caption"><strong>同样是一次 API 调用</strong><span>关键不在调用次数，而在 descriptor 的表达能力。</span></figcaption>
+        </figure>
+      </section>
+    </div>
+
+    <main>
+      <div class="shell">
+        <section id="dma">
+          <div class="section-head">
+            <div><div class="kicker">01 / DMA BASICS</div><h2>先把 DMA 放回整条链路里</h2></div>
+            <p>CPU 不亲自逐字节搬数据，而是把“从哪里、到哪里、搬多少”交给 DMA 引擎。CPU 的主要成本是准备描述信息并提交。</p>
+          </div>
+          <figure class="panel">
+            <div class="panel-pad">
+              <svg viewBox="0 0 1060 360" role="img" aria-label="CPU、DMA Engine、Host Memory 与 MLU Memory 的关系">
+                <defs>
+                  <marker id="a1" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#65f2b1" /></marker>
+                  <marker id="a2" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0 0L9 4.5L0 9Z" fill="#63d7ff" /></marker>
+                </defs>
+                <rect x="28" y="94" width="190" height="152" rx="22" fill="#132720" stroke="#65f2b1" stroke-opacity=".5" />
+                <text x="123" y="145" text-anchor="middle" fill="#eef6f3" font-size="24" font-weight="780">CPU</text>
+                <text x="123" y="176" text-anchor="middle" fill="#9aaca7" font-size="14">构造 descriptor</text>
+                <text x="123" y="199" text-anchor="middle" fill="#9aaca7" font-size="14">调用异步 API</text>
+                <rect x="292" y="70" width="256" height="200" rx="24" fill="#142720" stroke="#ffd166" stroke-opacity=".58" />
+                <text x="420" y="124" text-anchor="middle" fill="#ffd166" font-size="24" font-weight="780">DMA Engine</text>
+                <rect x="330" y="150" width="180" height="29" rx="8" fill="#293429" /><text x="420" y="170" text-anchor="middle" fill="#dce9e4" font-size="12">读取任务描述</text>
+                <rect x="330" y="187" width="180" height="29" rx="8" fill="#293429" /><text x="420" y="207" text-anchor="middle" fill="#dce9e4" font-size="12">驱动总线传输</text>
+                <rect x="330" y="224" width="180" height="29" rx="8" fill="#293429" /><text x="420" y="244" text-anchor="middle" fill="#dce9e4" font-size="12">写入目标地址</text>
+                <rect x="638" y="42" width="360" height="112" rx="21" fill="#0d211c" stroke="#63d7ff" stroke-opacity=".5" />
+                <text x="676" y="78" fill="#63d7ff" font-size="14" font-weight="720">HOST MEMORY</text>
+                <g fill="#22483b"><rect x="676" y="96" width="54" height="34" rx="7" /><rect x="738" y="96" width="54" height="34" rx="7" /><rect x="800" y="96" width="54" height="34" rx="7" /><rect x="862" y="96" width="54" height="34" rx="7" /></g>
+                <rect x="638" y="206" width="360" height="112" rx="21" fill="#0d211c" stroke="#7ba7ff" stroke-opacity=".5" />
+                <text x="676" y="242" fill="#7ba7ff" font-size="14" font-weight="720">MLU MEMORY</text>
+                <g fill="#263d69"><rect x="676" y="260" width="54" height="34" rx="7" /><rect x="738" y="260" width="54" height="34" rx="7" /><rect x="800" y="260" width="54" height="34" rx="7" /><rect x="862" y="260" width="54" height="34" rx="7" /></g>
+                <path d="M218 170H282" stroke="#65f2b1" stroke-width="3" marker-end="url(#a1)" />
+                <text x="250" y="156" text-anchor="middle" fill="#65f2b1" font-size="11">submit</text>
+                <path d="M548 130C592 130 594 100 628 100" fill="none" stroke="#63d7ff" stroke-width="3" marker-end="url(#a2)" />
+                <path d="M628 260C592 260 592 210 548 210" fill="none" stroke="#7ba7ff" stroke-width="3" marker-end="url(#a2)" />
+                <text x="588" y="181" text-anchor="middle" fill="#9aaca7" font-size="12">H2D / D2H</text>
+              </svg>
+            </div>
+            <figcaption class="figure-caption"><strong>DMA 的价值</strong><span>CPU 负责描述任务，DMA 引擎负责真正的数据通路。</span></figcaption>
+          </figure>
+        </section>
+
+        <section id="batch">
+          <div class="section-head">
+            <div><div class="kicker">02 / BATCH MEMCPY</div><h2>Batch：提交一张“逐项任务清单”</h2></div>
+            <p><code>cnMemcpyBatchAsync</code> 接收多组源地址、目标地址和字节数。它能处理任意映射，是最通用的兜底路径。</p>
+          </div>
+          <div class="grid-2">
+            <figure class="panel">
+              <div class="panel-pad">
+                <svg viewBox="0 0 520 470" role="img" aria-label="Batch Memcpy 四个 descriptor 的结构">
+                  <defs><marker id="ab" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#ff9d66" /></marker></defs>
+                  <text x="20" y="28" fill="#9aaca7" font-size="12">CPU 构造的 descriptor 数组</text>
+                  <g font-family="monospace" font-size="12">
+                    <rect x="20" y="48" width="480" height="62" rx="12" fill="#2b201a" stroke="#ff9d66" stroke-opacity=".45" /><text x="38" y="74" fill="#ffb78f">#0</text><text x="80" y="74" fill="#eef6f3">src=1000</text><text x="205" y="74" fill="#eef6f3">dst=2000</text><text x="340" y="74" fill="#ffd166">bytes=64</text><path d="M80 91H458" stroke="#ff9d66" stroke-width="2" marker-end="url(#ab)" />
+                    <rect x="20" y="122" width="480" height="62" rx="12" fill="#2b201a" stroke="#ff9d66" stroke-opacity=".38" /><text x="38" y="148" fill="#ffb78f">#1</text><text x="80" y="148" fill="#eef6f3">src=4816</text><text x="205" y="148" fill="#eef6f3">dst=9200</text><text x="340" y="148" fill="#ffd166">bytes=64</text><path d="M80 165H458" stroke="#ff9d66" stroke-width="2" marker-end="url(#ab)" />
+                    <rect x="20" y="196" width="480" height="62" rx="12" fill="#2b201a" stroke="#ff9d66" stroke-opacity=".31" /><text x="38" y="222" fill="#ffb78f">#2</text><text x="80" y="222" fill="#eef6f3">src=1472</text><text x="205" y="222" fill="#eef6f3">dst=2376</text><text x="340" y="222" fill="#ffd166">bytes=96</text><path d="M80 239H458" stroke="#ff9d66" stroke-width="2" marker-end="url(#ab)" />
+                    <rect x="20" y="270" width="480" height="62" rx="12" fill="#2b201a" stroke="#ff9d66" stroke-opacity=".24" /><text x="38" y="296" fill="#ffb78f">#3</text><text x="80" y="296" fill="#eef6f3">src=7296</text><text x="205" y="296" fill="#eef6f3">dst=3600</text><text x="340" y="296" fill="#ffd166">bytes=32</text><path d="M80 313H458" stroke="#ff9d66" stroke-width="2" marker-end="url(#ab)" />
+                  </g>
+                  <path d="M260 344V386" stroke="#8aa39b" stroke-width="2" stroke-dasharray="5 5" />
+                  <rect x="140" y="386" width="240" height="60" rx="16" fill="#18251f" stroke="#ff9d66" stroke-opacity=".55" />
+                  <text x="260" y="412" text-anchor="middle" fill="#eef6f3" font-size="15" font-weight="750">一次 API submit</text>
+                  <text x="260" y="433" text-anchor="middle" fill="#9aaca7" font-size="12">携带 4 条独立任务</text>
+                </svg>
+              </div>
+              <figcaption class="figure-caption"><strong>表达力最强</strong><span>每条任务都能拥有不同地址和不同大小。</span></figcaption>
+            </figure>
+
+            <div class="grid-2" style="grid-template-columns: 1fr; align-content: start">
+              <div class="card batch">
+                <h3>它擅长什么？</h3>
+                <p>KV block id 无规律、源和目标映射随机、每段大小可能不同。这时没法用一条 pitch 公式概括。</p>
+                <div class="metric"><strong>N</strong><span>个独立 descriptor</span></div>
+              </div>
+              <div class="card">
+                <h3>“Batch”不等于“一次大 memcpy”</h3>
+                <p>虽然调用一次 API，但参数里仍携带 N 组地址。驱动和 DMA 引擎仍需解析这些 descriptor。</p>
+              </div>
+              <div class="card">
+                <h3>它的成本在哪里？</h3>
+                <p>CPU 构造三个数组、驱动读取 descriptor、设备逐项解析。数据越碎，元数据相对成本越明显。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="twod">
+          <div class="section-head">
+            <div><div class="kicker">03 / 2D DMA</div><h2>2D：提交一条“固定步长公式”</h2></div>
+            <p><code>cnMemcpy2DAsync</code> 把一批等宽、等步长的行看作一个二维矩形。DMA 引擎用 width、height 和 pitch 自动生成每行地址。</p>
+          </div>
+          <figure class="panel">
+            <div class="panel-pad">
+              <div class="legend">
+                <span><i style="background: var(--cyan)"></i>源内存行</span>
+                <span><i style="background: var(--green)"></i>目标内存行</span>
+                <span><i style="background: #293b35"></i>pitch 中未复制的间隙</span>
+              </div>
+              <svg viewBox="0 0 1080 580" role="img" aria-label="2D DMA 的 width、height、src pitch 和 dst pitch 图解">
+                <defs>
+                  <marker id="ad" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#65f2b1" /></marker>
+                  <marker id="dim" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto-start-reverse"><path d="M0 4L8 0V8Z" fill="#ffd166" /></marker>
+                </defs>
+                <text x="70" y="42" fill="#63d7ff" font-size="18" font-weight="760">Source：src_pitch = 300 B</text>
+                <text x="678" y="42" fill="#65f2b1" font-size="18" font-weight="760">Destination：dst_pitch = 500 B</text>
+                <g>
+                  <g transform="translate(70 75)">
+                    <g><rect width="360" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b6680" /><text x="74" y="43" text-anchor="middle" fill="#e8fbff" font-size="13">copy 64 B</text></g>
+                    <g transform="translate(0 105)"><rect width="360" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b6680" /><text x="74" y="43" text-anchor="middle" fill="#e8fbff" font-size="13">copy 64 B</text></g>
+                    <g transform="translate(0 210)"><rect width="360" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b6680" /><text x="74" y="43" text-anchor="middle" fill="#e8fbff" font-size="13">copy 64 B</text></g>
+                    <g transform="translate(0 315)"><rect width="360" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b6680" /><text x="74" y="43" text-anchor="middle" fill="#e8fbff" font-size="13">copy 64 B</text></g>
+                    <path d="M0 417H148" stroke="#ffd166" stroke-width="2" marker-start="url(#dim)" marker-end="url(#dim)" /><text x="74" y="445" text-anchor="middle" fill="#ffd166" font-size="13">width</text>
+                    <path d="M385 0V105" stroke="#ffd166" stroke-width="2" marker-start="url(#dim)" marker-end="url(#dim)" /><text x="404" y="57" fill="#ffd166" font-size="13">pitch</text>
+                  </g>
+                  <g transform="translate(678 75)">
+                    <g><rect width="330" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b805c" /><text x="74" y="43" text-anchor="middle" fill="#eafff5" font-size="13">write 64 B</text></g>
+                    <g transform="translate(0 105)"><rect width="330" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b805c" /><text x="74" y="43" text-anchor="middle" fill="#eafff5" font-size="13">write 64 B</text></g>
+                    <g transform="translate(0 210)"><rect width="330" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b805c" /><text x="74" y="43" text-anchor="middle" fill="#eafff5" font-size="13">write 64 B</text></g>
+                    <g transform="translate(0 315)"><rect width="330" height="72" rx="12" fill="#15241f" /><rect width="148" height="72" rx="12" fill="#1b805c" /><text x="74" y="43" text-anchor="middle" fill="#eafff5" font-size="13">write 64 B</text></g>
+                    <path d="M-25 0V387" stroke="#ffd166" stroke-width="2" marker-start="url(#dim)" marker-end="url(#dim)" /><text x="-51" y="194" transform="rotate(-90 -51 194)" text-anchor="middle" fill="#ffd166" font-size="13">height = 4</text>
+                  </g>
+                  <g stroke="#65f2b1" stroke-width="2.5" fill="none" marker-end="url(#ad)" opacity=".9">
+                    <path d="M218 111C430 111 490 111 668 111" />
+                    <path d="M218 216C430 216 490 216 668 216" />
+                    <path d="M218 321C430 321 490 321 668 321" />
+                    <path d="M218 426C430 426 490 426 668 426" />
+                  </g>
+                </g>
+                <rect x="394" y="488" width="300" height="72" rx="18" fill="#173229" stroke="#65f2b1" stroke-opacity=".5" />
+                <text x="544" y="517" text-anchor="middle" fill="#eef6f3" font-size="15" font-weight="760">一个 2D descriptor</text>
+                <text x="544" y="541" text-anchor="middle" fill="#9aaca7" font-family="monospace" font-size="12">width=64 · height=4 · pitches</text>
+              </svg>
+            </div>
+            <figcaption class="figure-caption"><strong>2D 不是 Tensor 维度</strong><span>它描述的是“等宽行 + 固定地址步长”的原始字节布局。</span></figcaption>
+          </figure>
+
+          <div class="grid-3" style="margin-top: 20px">
+            <div class="card twod"><h3>width</h3><p>每一行真正复制的有效字节数。</p></div>
+            <div class="card twod"><h3>pitch</h3><p>本行起始地址到下一行起始地址的距离，可大于 width。</p></div>
+            <div class="card twod"><h3>height</h3><p>有多少行，也就是本次可覆盖多少个规则 descriptor。</p></div>
+          </div>
+        </section>
+
+        <section id="example">
+          <div class="section-head">
+            <div><div class="kicker">04 / ADDRESS EXAMPLE</div><h2>把同一个 KV 例子代入两种 API</h2></div>
+            <p>以下四段均为 64 字节。源地址每次增加 300，目标地址每次增加 500，因此可以被一条 2D 公式完整表达。</p>
+          </div>
+          <div class="grid-2">
+            <figure class="panel">
+              <div class="panel-pad">
+                <svg viewBox="0 0 520 440" role="img" aria-label="Batch API 表达固定步长地址的方式">
+                  <text x="22" y="32" fill="#ff9d66" font-size="18" font-weight="760">Batch 表达</text>
+                  <text x="22" y="58" fill="#9aaca7" font-size="12">规律存在，但 API 仍逐项接收</text>
+                  <g font-family="monospace" font-size="13">
+                    <rect x="22" y="86" width="476" height="54" rx="11" fill="#2a201a" /><text x="40" y="119" fill="#eef6f3">1000 → 2000</text><text x="392" y="119" fill="#ffd166">64 B</text>
+                    <rect x="22" y="151" width="476" height="54" rx="11" fill="#2a201a" /><text x="40" y="184" fill="#eef6f3">1300 → 2500</text><text x="392" y="184" fill="#ffd166">64 B</text>
+                    <rect x="22" y="216" width="476" height="54" rx="11" fill="#2a201a" /><text x="40" y="249" fill="#eef6f3">1600 → 3000</text><text x="392" y="249" fill="#ffd166">64 B</text>
+                    <rect x="22" y="281" width="476" height="54" rx="11" fill="#2a201a" /><text x="40" y="314" fill="#eef6f3">1900 → 3500</text><text x="392" y="314" fill="#ffd166">64 B</text>
+                  </g>
+                  <rect x="22" y="364" width="476" height="48" rx="12" fill="#1c2924" />
+                  <text x="260" y="394" text-anchor="middle" fill="#ffb58d" font-size="14" font-weight="730">需要 4 组 src / dst / bytes</text>
+                </svg>
+              </div>
+            </figure>
+            <figure class="panel">
+              <div class="panel-pad">
+                <svg viewBox="0 0 520 440" role="img" aria-label="2D DMA API 表达固定步长地址的方式">
+                  <text x="22" y="32" fill="#65f2b1" font-size="18" font-weight="760">2D 表达</text>
+                  <text x="22" y="58" fill="#9aaca7" font-size="12">用首地址和步长重建全部行</text>
+                  <rect x="22" y="86" width="476" height="249" rx="20" fill="#102a22" stroke="#65f2b1" stroke-opacity=".35" />
+                  <g font-family="monospace" font-size="15">
+                    <text x="55" y="127" fill="#9aaca7">src_addr</text><text x="248" y="127" fill="#eef6f3">1000</text>
+                    <text x="55" y="165" fill="#9aaca7">dst_addr</text><text x="248" y="165" fill="#eef6f3">2000</text>
+                    <text x="55" y="203" fill="#9aaca7">width</text><text x="248" y="203" fill="#ffd166">64</text>
+                    <text x="55" y="241" fill="#9aaca7">height</text><text x="248" y="241" fill="#ffd166">4</text>
+                    <text x="55" y="279" fill="#9aaca7">src_pitch</text><text x="248" y="279" fill="#63d7ff">300</text>
+                    <text x="55" y="317" fill="#9aaca7">dst_pitch</text><text x="248" y="317" fill="#65f2b1">500</text>
+                  </g>
+                  <rect x="22" y="364" width="476" height="48" rx="12" fill="#18352c" />
+                  <text x="260" y="394" text-anchor="middle" fill="#65f2b1" font-size="14" font-weight="730">只需要 1 个 2D descriptor</text>
+                </svg>
+              </div>
+            </figure>
+          </div>
+        </section>
+
+        <section id="cost">
+          <div class="section-head">
+            <div><div class="kicker">05 / COST MODEL</div><h2>优化的重点是元数据与提交开销</h2></div>
+            <p>2D DMA 不会神奇地减少有效数据字节数；它减少的是地址数组、descriptor 解析和多段任务管理。下面是概念示意，不是实测 benchmark。</p>
+          </div>
+          <figure class="panel">
+            <div class="panel-pad">
+              <svg viewBox="0 0 1060 420" role="img" aria-label="Batch 与 2D DMA 提交开销的概念时序对比">
+                <g font-size="13">
+                  <text x="28" y="84" fill="#ff9d66" font-size="17" font-weight="750">Batch</text>
+                  <text x="28" y="234" fill="#65f2b1" font-size="17" font-weight="750">2D DMA</text>
+                  <text x="170" y="40" fill="#9aaca7">CPU 准备</text><text x="430" y="40" fill="#9aaca7">驱动 / descriptor</text><text x="760" y="40" fill="#9aaca7">有效数据搬运</text>
+                </g>
+                <line x1="150" y1="52" x2="1010" y2="52" stroke="#2a3b35" />
+                <g>
+                  <rect x="150" y="68" width="230" height="62" rx="10" fill="#673c29" /><text x="265" y="104" text-anchor="middle" fill="#fff0e7" font-size="13">构造 N 组地址数组</text>
+                  <rect x="388" y="68" width="312" height="62" rx="10" fill="#56302d" /><text x="544" y="104" text-anchor="middle" fill="#fff0e7" font-size="13">读取 / 解析 N 个 descriptor</text>
+                  <rect x="708" y="68" width="302" height="62" rx="10" fill="#20543f" /><text x="859" y="104" text-anchor="middle" fill="#e8fff5" font-size="13">搬运 N × width 字节</text>
+                  <text x="150" y="155" fill="#9aaca7" font-size="11">元数据规模随 N 增长</text>
+                </g>
+                <g>
+                  <rect x="150" y="218" width="110" height="62" rx="10" fill="#1e6850" /><text x="205" y="244" text-anchor="middle" fill="#eafff5" font-size="12">填写</text><text x="205" y="263" text-anchor="middle" fill="#eafff5" font-size="12">6 个参数</text>
+                  <rect x="268" y="218" width="126" height="62" rx="10" fill="#1d5b4a" /><text x="331" y="244" text-anchor="middle" fill="#eafff5" font-size="12">解析 1 个</text><text x="331" y="263" text-anchor="middle" fill="#eafff5" font-size="12">2D descriptor</text>
+                  <rect x="402" y="218" width="608" height="62" rx="10" fill="#20543f" /><text x="706" y="254" text-anchor="middle" fill="#e8fff5" font-size="13">搬运 N × width 字节（与 Batch 相同）</text>
+                  <text x="150" y="305" fill="#9aaca7" font-size="11">元数据规模近似常量</text>
+                </g>
+                <g transform="translate(150 342)">
+                  <rect width="860" height="48" rx="13" fill="#101e1a" stroke="#34483f" />
+                  <text x="25" y="30" fill="#ffd166" font-size="12" font-weight="720">注意</text>
+                  <text x="84" y="30" fill="#b8c7c2" font-size="12">真实收益取决于行宽、行数、驱动实现、总线利用率与设备；必须以目标机器 benchmark 为准。</text>
+                </g>
+              </svg>
+            </div>
+          </figure>
+        </section>
+
+        <section id="dispatch">
+          <div class="section-head">
+            <div><div class="kicker">06 / XLLM DISPATCH</div><h2>xLLM 怎样决定走哪条路径？</h2></div>
+            <p>代码扫描相邻 descriptor 的地址变化：同 storage、同字节数、源和目标方向一致，并且 stride 稳定，才有资格转成 2D DMA。</p>
+          </div>
+
+          <div class="panel panel-pad">
+            <div class="tabs" role="tablist" aria-label="地址布局示例">
+              <button class="active" data-demo="contiguous" role="tab">完全连续</button>
+              <button data-demo="strided" role="tab">固定步长</button>
+              <button data-demo="random" role="tab">随机映射</button>
+            </div>
+
+            <div id="demo-contiguous" class="demo-view active">
+              <svg viewBox="0 0 1050 370" role="img" aria-label="连续地址合并为 extent">
+                <text x="24" y="34" fill="#9aaca7" font-size="12">src +64 / dst +64 / 每行 64B</text>
+                <g fill="#245b48"><rect x="24" y="70" width="150" height="64" rx="11" /><rect x="176" y="70" width="150" height="64" rx="11" /><rect x="328" y="70" width="150" height="64" rx="11" /><rect x="480" y="70" width="150" height="64" rx="11" /></g>
+                <g fill="#e7fff5" font-family="monospace" font-size="12"><text x="99" y="108" text-anchor="middle">row 0</text><text x="251" y="108" text-anchor="middle">row 1</text><text x="403" y="108" text-anchor="middle">row 2</text><text x="555" y="108" text-anchor="middle">row 3</text></g>
+                <path d="M24 165H630" stroke="#65f2b1" stroke-width="3" />
+                <text x="327" y="194" text-anchor="middle" fill="#65f2b1" font-size="13">物理上是一整段连续 256B</text>
+                <path d="M672 105H760" stroke="#8aa39b" stroke-width="2" stroke-dasharray="5 5" />
+                <rect x="780" y="60" width="240" height="118" rx="20" fill="#163027" stroke="#65f2b1" stroke-opacity=".55" />
+                <text x="900" y="101" text-anchor="middle" fill="#eef6f3" font-size="18" font-weight="780">Extent</text>
+                <text x="900" y="130" text-anchor="middle" fill="#9aaca7" font-size="12">1 × batch descriptor</text>
+                <text x="900" y="151" text-anchor="middle" fill="#ffd166" font-family="monospace" font-size="12">bytes = 4 × 64</text>
+                <rect x="24" y="240" width="996" height="92" rx="18" fill="#0c1b17" stroke="#31453e" />
+                <text x="52" y="276" fill="#65f2b1" font-size="13" font-weight="750">判定</text>
+                <text x="116" y="276" fill="#c3d2cd" font-size="13">src_pitch == width 且 dst_pitch == width</text>
+                <text x="52" y="307" fill="#9aaca7" font-size="12">这里无需 2D：直接合并为一次更大的连续 copy 即可。</text>
+              </svg>
+            </div>
+
+            <div id="demo-strided" class="demo-view">
+              <svg viewBox="0 0 1050 370" role="img" aria-label="固定步长地址转换为 2D DMA">
+                <text x="24" y="34" fill="#9aaca7" font-size="12">src +300 / dst +500 / 每行 64B</text>
+                <g>
+                  <g fill="#1f657d"><rect x="24" y="65" width="90" height="48" rx="9" /><rect x="174" y="65" width="90" height="48" rx="9" /><rect x="324" y="65" width="90" height="48" rx="9" /><rect x="474" y="65" width="90" height="48" rx="9" /></g>
+                  <g fill="#e8fbff" font-family="monospace" font-size="11"><text x="69" y="94" text-anchor="middle">1000</text><text x="219" y="94" text-anchor="middle">1300</text><text x="369" y="94" text-anchor="middle">1600</text><text x="519" y="94" text-anchor="middle">1900</text></g>
+                  <g fill="#23805c"><rect x="24" y="145" width="90" height="48" rx="9" /><rect x="204" y="145" width="90" height="48" rx="9" /><rect x="384" y="145" width="90" height="48" rx="9" /><rect x="564" y="145" width="90" height="48" rx="9" /></g>
+                  <g fill="#eafff5" font-family="monospace" font-size="11"><text x="69" y="174" text-anchor="middle">2000</text><text x="249" y="174" text-anchor="middle">2500</text><text x="429" y="174" text-anchor="middle">3000</text><text x="609" y="174" text-anchor="middle">3500</text></g>
+                </g>
+                <path d="M700 125H770" stroke="#8aa39b" stroke-width="2" stroke-dasharray="5 5" />
+                <rect x="790" y="68" width="230" height="126" rx="20" fill="#163027" stroke="#65f2b1" stroke-opacity=".58" />
+                <text x="905" y="105" text-anchor="middle" fill="#65f2b1" font-size="18" font-weight="780">2D DMA</text>
+                <text x="905" y="134" text-anchor="middle" fill="#d7e7e1" font-family="monospace" font-size="11">width=64 · height=4</text>
+                <text x="905" y="157" text-anchor="middle" fill="#d7e7e1" font-family="monospace" font-size="11">pitches=300 / 500</text>
+                <rect x="24" y="240" width="996" height="92" rx="18" fill="#0c1b17" stroke="#31453e" />
+                <text x="52" y="276" fill="#65f2b1" font-size="13" font-weight="750">判定</text>
+                <text x="116" y="276" fill="#c3d2cd" font-size="13">至少 3 行确认固定 stride，且 pitch ≥ width</text>
+                <text x="52" y="307" fill="#9aaca7" font-size="12">两个点只能确定一条线，第三个点才能确认“持续固定步长”，避免错误合并。</text>
+              </svg>
+            </div>
+
+            <div id="demo-random" class="demo-view">
+              <svg viewBox="0 0 1050 370" role="img" aria-label="随机地址映射回退到 Batch Memcpy">
+                <text x="24" y="34" fill="#9aaca7" font-size="12">步长不一致 / 方向变化 / 大小不同</text>
+                <g fill="#5b382a"><rect x="24" y="65" width="105" height="48" rx="9" /><rect x="252" y="65" width="105" height="48" rx="9" /><rect x="150" y="65" width="74" height="48" rx="9" /><rect x="474" y="65" width="132" height="48" rx="9" /></g>
+                <g fill="#fff0e7" font-family="monospace" font-size="11"><text x="76" y="94" text-anchor="middle">src 10</text><text x="304" y="94" text-anchor="middle">src 900</text><text x="187" y="94" text-anchor="middle">src 23</text><text x="540" y="94" text-anchor="middle">src 700</text></g>
+                <g stroke="#ff9d66" stroke-width="2" stroke-dasharray="5 4"><path d="M76 120L490 192" /><path d="M304 120L160 192" /><path d="M187 120L650 192" /><path d="M540 120L310 192" /></g>
+                <g fill="#452c31"><rect x="438" y="198" width="105" height="48" rx="9" /><rect x="108" y="198" width="105" height="48" rx="9" /><rect x="598" y="198" width="105" height="48" rx="9" /><rect x="258" y="198" width="105" height="48" rx="9" /></g>
+                <path d="M730 145H780" stroke="#8aa39b" stroke-width="2" stroke-dasharray="5 5" />
+                <rect x="800" y="86" width="220" height="126" rx="20" fill="#30211c" stroke="#ff9d66" stroke-opacity=".58" />
+                <text x="910" y="124" text-anchor="middle" fill="#ffb38a" font-size="18" font-weight="780">Batch</text>
+                <text x="910" y="153" text-anchor="middle" fill="#d7e7e1" font-size="12">保留 4 条 descriptor</text>
+                <text x="910" y="177" text-anchor="middle" fill="#9aaca7" font-size="11">通用兜底路径</text>
+                <rect x="24" y="277" width="996" height="62" rx="17" fill="#0c1b17" stroke="#31453e" />
+                <text x="52" y="314" fill="#ffb38a" font-size="13" font-weight="750">不能硬转 2D：</text>
+                <text x="168" y="314" fill="#c3d2cd" font-size="13">否则 DMA 会按错误公式访问未授权或错误地址，直接造成数据损坏。</text>
+              </svg>
+            </div>
+          </div>
+
+          <figure class="panel" style="margin-top: 22px">
+            <div class="panel-pad">
+              <svg viewBox="0 0 1080 540" role="img" aria-label="xLLM copy descriptor 分流决策树">
+                <defs><marker id="tree" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8Z" fill="#71877f" /></marker></defs>
+                <g fill="none" stroke="#71877f" stroke-width="2" marker-end="url(#tree)">
+                  <path d="M540 100V142" /><path d="M540 220V250H260V286" /><path d="M540 250H820V286" /><path d="M260 364V394H130V430" /><path d="M260 394H390V430" /><path d="M820 364V430" />
+                </g>
+                <g>
+                  <rect x="390" y="34" width="300" height="68" rx="18" fill="#163027" stroke="#65f2b1" stroke-opacity=".45" /><text x="540" y="75" text-anchor="middle" fill="#eef6f3" font-size="17" font-weight="760">输入 N 个 copy descriptors</text>
+                  <rect x="360" y="142" width="360" height="78" rx="18" fill="#17241f" stroke="#63d7ff" stroke-opacity=".42" /><text x="540" y="176" text-anchor="middle" fill="#eef6f3" font-size="15" font-weight="730">相邻项：同 storage、同 bytes？</text><text x="540" y="199" text-anchor="middle" fill="#9aaca7" font-size="12">地址方向一致且不重叠？</text>
+                  <text x="360" y="242" fill="#ff9d66" font-size="12">否</text><text x="704" y="242" fill="#65f2b1" font-size="12">是</text>
+                  <rect x="80" y="286" width="360" height="78" rx="18" fill="#30211c" stroke="#ff9d66" stroke-opacity=".45" /><text x="260" y="332" text-anchor="middle" fill="#ffb38a" font-size="16" font-weight="740">Batch fallback</text>
+                  <rect x="640" y="286" width="360" height="78" rx="18" fill="#17241f" stroke="#ffd166" stroke-opacity=".45" /><text x="820" y="320" text-anchor="middle" fill="#eef6f3" font-size="15" font-weight="730">src / dst pitch 固定？</text><text x="820" y="343" text-anchor="middle" fill="#9aaca7" font-size="12">至少 3 项确认模式</text>
+                  <rect x="30" y="430" width="200" height="70" rx="17" fill="#30211c" stroke="#ff9d66" stroke-opacity=".45" /><text x="130" y="472" text-anchor="middle" fill="#ffb38a" font-size="14" font-weight="730">随机 Batch</text>
+                  <rect x="290" y="430" width="200" height="70" rx="17" fill="#173229" stroke="#65f2b1" stroke-opacity=".45" /><text x="390" y="460" text-anchor="middle" fill="#65f2b1" font-size="14" font-weight="730">连续 Extent</text><text x="390" y="481" text-anchor="middle" fill="#9aaca7" font-size="11">pitch == width</text>
+                  <rect x="710" y="430" width="220" height="70" rx="17" fill="#173229" stroke="#63d7ff" stroke-opacity=".55" /><text x="820" y="460" text-anchor="middle" fill="#63d7ff" font-size="14" font-weight="730">2D DMA</text><text x="820" y="481" text-anchor="middle" fill="#9aaca7" font-size="11">fixed pitch ≥ width</text>
+                </g>
+              </svg>
+            </div>
+            <figcaption class="figure-caption"><strong>先保证正确性，再谈优化</strong><span>任何不满足固定模式的 descriptor 都回退到 Batch。</span></figcaption>
+          </figure>
+        </section>
+
+        <section id="code">
+          <div class="section-head">
+            <div><div class="kicker">07 / CODE MAP</div><h2>对应到当前实现，大致是这段逻辑</h2></div>
+            <p>代码先识别一段 run，再选择 extent、2D 或 batch。2D 提交前会先 flush 已累积的 batch，保持原始复制顺序。</p>
+          </div>
+          <div class="grid-2">
+            <pre aria-label="xLLM 2D DMA 分流伪代码"><span class="kw">while</span> (begin &lt; descriptors.size()) {
+  run = <span class="fn">find_direct_copy_run</span>(descriptors, begin);
+
+  <span class="kw">if</span> (run.kind == TWO_DIMENSIONAL) {
+    <span class="fn">flush_batch</span>();
+    <span class="fn">cnMemcpy2DAsync</span>(
+        dst_addr,
+        run.dst_pitch,
+        src_addr,
+        run.src_pitch,
+        row_bytes,       <span class="cm">// width</span>
+        run.count,       <span class="cm">// height</span>
+        queue);
+    begin += run.count;
+    <span class="kw">continue</span>;
+  }
+
+  <span class="kw">if</span> (run.kind == EXTENT) {
+    bytes = row_bytes * run.count;
+  } <span class="kw">else</span> {
+    bytes = row_bytes;   <span class="cm">// batch fallback</span>
+  }
+  batch.<span class="fn">push</span>(src, dst, bytes);
+}</pre>
+            <div class="grid-2" style="grid-template-columns: 1fr; align-content: start">
+              <div class="card"><h3>为什么 2D 前要 flush batch？</h3><p>如果前面已有随机 descriptor，必须先提交它们，再提交 2D，才能保持调用者给出的顺序和队列语义。</p></div>
+              <div class="card"><h3>为什么比较 storage？</h3><p>仅靠虚拟地址碰巧等差不够安全。同一 run 的 tensor 必须来自相同源 storage 和目标 storage。</p></div>
+              <div class="card"><h3>为什么 reverse 需要特别处理？</h3><p>2D API 使用正 pitch。反向 descriptor 序列需要从最低地址那一行开始，再用正 pitch 覆盖整段。</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="compare">
+          <div class="section-head">
+            <div><div class="kicker">08 / CHEAT SHEET</div><h2>最终对照表</h2></div>
+            <p>选择依据不是“哪个 API 看起来更高级”，而是地址布局能否被安全、完整地压缩为规则公式。</p>
+          </div>
+          <div class="panel" style="overflow-x: auto">
+            <table>
+              <thead><tr><th>维度</th><th>Batch Memcpy</th><th>2D DMA</th><th>连续 Extent</th></tr></thead>
+              <tbody>
+                <tr><td>地址要求</td><td>可完全随机</td><td>源和目标分别固定 pitch</td><td>源、目标都连续</td></tr>
+                <tr><td>每段大小</td><td>可以不同</td><td>每行 width 相同</td><td>合并为总字节数</td></tr>
+                <tr><td>descriptor 规模</td><td>N 条</td><td class="yes">1 条</td><td class="yes">1 条</td></tr>
+                <tr><td>适合场景</td><td>随机 block id / scatter-gather</td><td>规则 KV 行、固定步长布局</td><td>完全连续的 KV 行</td></tr>
+                <tr><td>通用性</td><td class="yes">最高</td><td class="maybe">中等</td><td>最低</td></tr>
+                <tr><td>主要价值</td><td>保证任意映射正确</td><td>压缩规则任务元数据</td><td>变成一次大块复制</td></tr>
+                <tr><td>xLLM 角色</td><td>安全兜底</td><td>固定 stride 快路径</td><td>连续快路径</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section>
+          <div class="takeaway">
+            <div>
+              <div class="kicker">THE MENTAL MODEL</div>
+              <div class="big">清单<br />vs<br />公式</div>
+            </div>
+            <div>
+              <h2 style="font-size: clamp(27px, 3vw, 40px); margin-bottom: 22px">记住这四点就够了</h2>
+              <ul>
+                <li><strong>Batch Memcpy</strong>：一次调用携带 N 条独立 copy 清单，最通用。</li>
+                <li><strong>2D DMA</strong>：一次调用携带一条 width / height / pitch 公式，适合规则地址。</li>
+                <li>2D 优化减少的是 descriptor 和提交管理成本，不减少有效数据字节数。</li>
+                <li>规则不成立时必须回退 Batch；错误使用 2D 会复制到错误地址。</li>
+              </ul>
+              <div class="callout" style="margin-top: 24px"><span class="badge">结论</span><p>对 xLLM KV Cache 来说：连续就合并，固定 stride 就 2D，剩下全部 Batch。</p></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <footer>
+      <div class="shell">xLLM MLU KV Cache Copy Explainer · 所有图形均为内嵌 SVG，可离线浏览。</div>
+    </footer>
+
+    <script>
+      const buttons = document.querySelectorAll("[data-demo]");
+      const views = document.querySelectorAll(".demo-view");
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          buttons.forEach((item) => item.classList.remove("active"));
+          views.forEach((item) => item.classList.remove("active"));
+          button.classList.add("active");
+          document.querySelector(`#demo-${button.dataset.demo}`).classList.add("active");
+        });
+      });
+    </script>
+  </body>
+</html>

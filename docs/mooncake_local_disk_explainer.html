@@ -1,0 +1,1185 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="用交互流程图解释 xLLM、vLLM 与 SGLang 如何通过 Mooncake 从内存和 LOCAL_DISK 恢复 KV Cache。"
+    />
+    <title>Mooncake KV Cache：内存能读，为什么 SSD 还要单独接？</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #eef5f2;
+        --muted: #9db0aa;
+        --paper: #08110f;
+        --panel: rgba(16, 31, 27, 0.84);
+        --panel-strong: #12241f;
+        --line: rgba(178, 220, 205, 0.16);
+        --green: #67f5b5;
+        --green-deep: #1bbf7a;
+        --yellow: #ffd166;
+        --red: #ff6b6b;
+        --blue: #69b7ff;
+        --purple: #b9a1ff;
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at 12% 8%, rgba(55, 177, 126, 0.16), transparent 31rem),
+          radial-gradient(circle at 90% 22%, rgba(105, 183, 255, 0.12), transparent 27rem),
+          linear-gradient(180deg, #07100e 0%, #091713 52%, #07100e 100%);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        line-height: 1.65;
+      }
+
+      body::before {
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        content: "";
+        opacity: 0.16;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        background-size: 42px 42px;
+        mask-image: linear-gradient(to bottom, black, transparent 78%);
+      }
+
+      a {
+        color: var(--green);
+      }
+
+      button {
+        font: inherit;
+      }
+
+      .shell {
+        width: min(1160px, calc(100% - 36px));
+        margin: 0 auto;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+        gap: 44px;
+        align-items: center;
+        min-height: 90vh;
+        padding: 76px 0 54px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        gap: 9px;
+        align-items: center;
+        margin-bottom: 20px;
+        color: var(--green);
+        font-size: 13px;
+        font-weight: 760;
+        letter-spacing: 0.13em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        width: 28px;
+        height: 1px;
+        content: "";
+        background: var(--green);
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 800px;
+        margin-bottom: 24px;
+        font-size: clamp(42px, 7vw, 82px);
+        line-height: 1.03;
+        letter-spacing: -0.055em;
+      }
+
+      h1 em {
+        color: var(--yellow);
+        font-style: normal;
+      }
+
+      .lede {
+        max-width: 700px;
+        margin-bottom: 32px;
+        color: #c1d0cb;
+        font-size: clamp(17px, 2vw, 22px);
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        min-height: 46px;
+        padding: 0 18px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--ink);
+        background: rgba(255, 255, 255, 0.04);
+        text-decoration: none;
+        transition: 180ms ease;
+      }
+
+      .button.primary {
+        border-color: transparent;
+        color: #062016;
+        background: var(--green);
+        font-weight: 760;
+      }
+
+      .button:hover {
+        transform: translateY(-2px);
+        border-color: rgba(103, 245, 181, 0.55);
+      }
+
+      .answer-card {
+        position: relative;
+        overflow: hidden;
+        padding: 30px;
+        border: 1px solid rgba(103, 245, 181, 0.23);
+        border-radius: 28px;
+        background: linear-gradient(145deg, rgba(24, 51, 42, 0.92), rgba(10, 23, 19, 0.94));
+        box-shadow: var(--shadow);
+      }
+
+      .answer-card::after {
+        position: absolute;
+        top: -76px;
+        right: -66px;
+        width: 180px;
+        height: 180px;
+        border-radius: 50%;
+        content: "";
+        background: rgba(103, 245, 181, 0.12);
+        filter: blur(2px);
+      }
+
+      .answer-card .label {
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      .answer-card .big {
+        margin: 12px 0 14px;
+        color: var(--green);
+        font-size: clamp(28px, 4vw, 46px);
+        font-weight: 850;
+        line-height: 1.1;
+        letter-spacing: -0.035em;
+      }
+
+      .answer-card p:last-child {
+        margin-bottom: 0;
+        color: #bed0ca;
+      }
+
+      main {
+        padding-bottom: 96px;
+      }
+
+      section {
+        padding: 58px 0;
+      }
+
+      .section-head {
+        display: grid;
+        grid-template-columns: minmax(0, 0.75fr) minmax(280px, 1.25fr);
+        gap: 36px;
+        align-items: end;
+        margin-bottom: 30px;
+      }
+
+      .kicker {
+        margin-bottom: 10px;
+        color: var(--green);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+      }
+
+      h2 {
+        margin-bottom: 0;
+        font-size: clamp(30px, 4.7vw, 54px);
+        line-height: 1.08;
+        letter-spacing: -0.04em;
+      }
+
+      .section-head > p {
+        margin-bottom: 4px;
+        color: var(--muted);
+        font-size: 17px;
+      }
+
+      .concept-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+
+      .concept {
+        min-height: 210px;
+        padding: 24px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: var(--panel);
+      }
+
+      .concept .number {
+        display: grid;
+        width: 38px;
+        height: 38px;
+        margin-bottom: 28px;
+        place-items: center;
+        border-radius: 12px;
+        color: #071510;
+        background: var(--green);
+        font-weight: 850;
+      }
+
+      .concept h3 {
+        margin-bottom: 8px;
+        font-size: 21px;
+      }
+
+      .concept p {
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .flow-lab {
+        padding: 26px;
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: rgba(9, 23, 19, 0.86);
+        box-shadow: var(--shadow);
+      }
+
+      .scenario-switcher {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 28px;
+        padding: 6px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: rgba(0, 0, 0, 0.14);
+      }
+
+      .scenario-button {
+        flex: 1 1 160px;
+        min-height: 44px;
+        padding: 8px 14px;
+        border: 0;
+        border-radius: 11px;
+        color: var(--muted);
+        background: transparent;
+        cursor: pointer;
+        transition: 160ms ease;
+      }
+
+      .scenario-button[aria-selected="true"] {
+        color: #082116;
+        background: var(--green);
+        font-weight: 820;
+      }
+
+      .storage-flow {
+        display: grid;
+        grid-template-columns: 1fr 82px 1fr 82px 1fr 82px 1fr;
+        align-items: stretch;
+      }
+
+      .tier {
+        position: relative;
+        display: flex;
+        min-height: 214px;
+        padding: 21px;
+        flex-direction: column;
+        justify-content: space-between;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        background: var(--panel-strong);
+        transition: 200ms ease;
+      }
+
+      .tier::before {
+        position: absolute;
+        top: 17px;
+        right: 17px;
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        content: "";
+        background: #41534d;
+        box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.02);
+      }
+
+      .tier.active {
+        border-color: rgba(103, 245, 181, 0.5);
+        background: linear-gradient(155deg, rgba(24, 58, 46, 0.94), rgba(14, 31, 26, 0.94));
+        transform: translateY(-3px);
+      }
+
+      .tier.active::before {
+        background: var(--green);
+        box-shadow: 0 0 18px rgba(103, 245, 181, 0.9);
+      }
+
+      .tier.blocked {
+        border-color: rgba(255, 107, 107, 0.36);
+      }
+
+      .tier.blocked::before {
+        background: var(--red);
+      }
+
+      .tier-icon {
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.1em;
+      }
+
+      .tier h3 {
+        margin: 18px 0 4px;
+        font-size: 23px;
+        line-height: 1.15;
+      }
+
+      .tier p {
+        margin-bottom: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .tier .status {
+        display: inline-flex;
+        width: fit-content;
+        margin-top: 18px;
+        padding: 5px 9px;
+        border-radius: 999px;
+        color: #bdd0ca;
+        background: rgba(255, 255, 255, 0.05);
+        font-size: 12px;
+        font-weight: 760;
+      }
+
+      .arrow {
+        position: relative;
+        display: grid;
+        min-height: 120px;
+        place-items: center;
+      }
+
+      .arrow-line {
+        position: relative;
+        width: calc(100% - 12px);
+        height: 2px;
+        overflow: visible;
+        background: #31463f;
+      }
+
+      .arrow-line::after {
+        position: absolute;
+        top: -4px;
+        right: -2px;
+        width: 8px;
+        height: 8px;
+        border-top: 2px solid #526c63;
+        border-right: 2px solid #526c63;
+        content: "";
+        transform: rotate(45deg);
+      }
+
+      .arrow.enabled .arrow-line {
+        background: var(--green);
+        box-shadow: 0 0 13px rgba(103, 245, 181, 0.4);
+      }
+
+      .arrow.enabled .arrow-line::before {
+        position: absolute;
+        top: -3px;
+        left: 0;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        content: "";
+        background: #eafff5;
+        box-shadow: 0 0 11px var(--green);
+        animation: packet 1.7s linear infinite;
+      }
+
+      .arrow.enabled .arrow-line::after {
+        border-color: var(--green);
+      }
+
+      .arrow.blocked .arrow-line {
+        background: repeating-linear-gradient(
+          90deg,
+          var(--red) 0 8px,
+          transparent 8px 14px
+        );
+      }
+
+      .arrow-label {
+        position: absolute;
+        top: calc(50% + 12px);
+        color: var(--muted);
+        font-size: 11px;
+        text-align: center;
+      }
+
+      @keyframes packet {
+        from {
+          left: 0;
+        }
+        to {
+          left: calc(100% - 5px);
+        }
+      }
+
+      .scenario-note {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 18px;
+        align-items: center;
+        margin-top: 24px;
+        padding: 18px 20px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .scenario-note strong {
+        display: block;
+        margin-bottom: 3px;
+      }
+
+      .scenario-note p {
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .result-pill {
+        padding: 8px 12px;
+        border-radius: 999px;
+        color: #082116;
+        background: var(--green);
+        font-size: 13px;
+        font-weight: 850;
+        white-space: nowrap;
+      }
+
+      .result-pill.fail {
+        color: #2a0808;
+        background: var(--red);
+      }
+
+      .story {
+        display: grid;
+        gap: 12px;
+      }
+
+      .story-row {
+        display: grid;
+        grid-template-columns: 72px minmax(0, 1fr) minmax(170px, 0.42fr);
+        gap: 16px;
+        align-items: center;
+        padding: 17px 20px;
+        border: 1px solid var(--line);
+        border-radius: 17px;
+        background: var(--panel);
+      }
+
+      .story-row .time {
+        color: var(--green);
+        font-weight: 850;
+      }
+
+      .story-row p {
+        margin-bottom: 0;
+        color: var(--muted);
+      }
+
+      .story-row code,
+      .code {
+        color: #d9fff0;
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      }
+
+      .story-row .outcome {
+        justify-self: end;
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 750;
+        text-align: right;
+      }
+
+      .comparison {
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: var(--panel);
+      }
+
+      table {
+        width: 100%;
+        min-width: 780px;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 18px 20px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      td:first-child {
+        font-weight: 810;
+      }
+
+      .yes,
+      .no,
+      .partial {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 800;
+      }
+
+      .yes {
+        color: var(--green);
+      }
+
+      .no {
+        color: var(--red);
+      }
+
+      .partial {
+        color: var(--yellow);
+      }
+
+      .takeaway {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+        gap: 24px;
+        align-items: stretch;
+      }
+
+      .takeaway-main,
+      .takeaway-side {
+        padding: clamp(24px, 5vw, 44px);
+        border-radius: 26px;
+      }
+
+      .takeaway-main {
+        color: #062217;
+        background: var(--green);
+      }
+
+      .takeaway-main .kicker,
+      .takeaway-main p {
+        color: #174633;
+      }
+
+      .takeaway-main h2 {
+        max-width: 720px;
+        margin-bottom: 20px;
+      }
+
+      .takeaway-main p {
+        max-width: 760px;
+        margin-bottom: 0;
+        font-size: 18px;
+        font-weight: 600;
+      }
+
+      .takeaway-side {
+        border: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      .takeaway-side h3 {
+        font-size: 21px;
+      }
+
+      .takeaway-side ul {
+        margin: 0;
+        padding-left: 20px;
+        color: var(--muted);
+      }
+
+      .takeaway-side li + li {
+        margin-top: 10px;
+      }
+
+      footer {
+        padding: 26px 0 48px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .footer-row {
+        display: flex;
+        gap: 20px;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      @media (max-width: 940px) {
+        .hero,
+        .section-head,
+        .takeaway {
+          grid-template-columns: 1fr;
+        }
+
+        .hero {
+          min-height: auto;
+          padding-top: 70px;
+        }
+
+        .concept-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .storage-flow {
+          grid-template-columns: 1fr;
+        }
+
+        .arrow {
+          min-height: 70px;
+        }
+
+        .arrow-line {
+          width: 2px;
+          height: 48px;
+        }
+
+        .arrow-line::after {
+          top: auto;
+          right: -4px;
+          bottom: 0;
+          transform: rotate(135deg);
+        }
+
+        .arrow.enabled .arrow-line::before {
+          top: 0;
+          left: -3px;
+          animation: packet-vertical 1.7s linear infinite;
+        }
+
+        .arrow.blocked .arrow-line {
+          background: repeating-linear-gradient(
+            180deg,
+            var(--red) 0 8px,
+            transparent 8px 14px
+          );
+        }
+
+        .arrow-label {
+          top: 50%;
+          left: calc(50% + 12px);
+          transform: translateY(-50%);
+          white-space: nowrap;
+        }
+
+        @keyframes packet-vertical {
+          from {
+            top: 0;
+          }
+          to {
+            top: calc(100% - 5px);
+          }
+        }
+      }
+
+      @media (max-width: 640px) {
+        .shell {
+          width: min(100% - 24px, 1160px);
+        }
+
+        section {
+          padding: 42px 0;
+        }
+
+        .flow-lab {
+          padding: 14px;
+          border-radius: 20px;
+        }
+
+        .story-row {
+          grid-template-columns: 54px 1fr;
+        }
+
+        .story-row .outcome {
+          grid-column: 2;
+          justify-self: start;
+          text-align: left;
+        }
+
+        .scenario-note,
+        .footer-row {
+          grid-template-columns: 1fr;
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .result-pill {
+          justify-self: start;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="shell hero">
+      <div>
+        <div class="eyebrow">KV Cache storage path explained</div>
+        <h1>内存已经双向，为什么 <em>SSD</em> 还要单独接？</h1>
+        <p class="lede">
+          因为“双向”只说明内存地址之间能来回搬运。Mooncake 把副本淘汰到
+          <span class="code">LOCAL_DISK</span> 后，必须先调用 RealClient
+          把文件读出来，才能继续搬运。
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#interactive">看交互流程</a>
+          <a class="button" href="#comparison">直接看对比表</a>
+        </div>
+      </div>
+
+      <aside class="answer-card" aria-label="一句话结论">
+        <div class="label">一句话结论</div>
+        <div class="big">接了仓库，不等于接了仓库的地下室。</div>
+        <p>
+          Mooncake 管理 MEMORY 和 SSD；但调用方使用的接口必须能够处理两种副本。
+          原始 xLLM 只闭环了 MEMORY，修复后才闭环 LOCAL_DISK 回读。
+        </p>
+      </aside>
+    </header>
+
+    <main>
+      <section class="shell" aria-labelledby="three-things-title">
+        <div class="section-head">
+          <div>
+            <div class="kicker">先分清三件事</div>
+            <h2 id="three-things-title">三个能力，不是一回事</h2>
+          </div>
+          <p>
+            最容易混淆的是：Mooncake “支持 SSD”属于存储系统能力；xLLM
+            “能从 SSD 恢复”属于客户端接入能力。
+          </p>
+        </div>
+
+        <div class="concept-grid">
+          <article class="concept">
+            <div class="number">1</div>
+            <h3>设备搬运</h3>
+            <p>NPU/MLU HBM 与 xLLM Host KV Cache 之间复制，由各硬件后端完成。</p>
+          </article>
+          <article class="concept">
+            <div class="number">2</div>
+            <h3>Mooncake 内存传输</h3>
+            <p>Host 与 Mooncake MEMORY 副本之间读写，目标是可寻址的内存。</p>
+          </article>
+          <article class="concept">
+            <div class="number">3</div>
+            <h3>SSD 回读</h3>
+            <p>LOCAL_DISK 没有可直接 memcpy/RDMA 的地址，RealClient 必须先读取文件。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="interactive" class="shell" aria-labelledby="interactive-title">
+        <div class="section-head">
+          <div>
+            <div class="kicker">交互路径</div>
+            <h2 id="interactive-title">点一下，看谁能走到 SSD</h2>
+          </div>
+          <p>
+            绿色表示该场景已经闭环；红色虚线表示对象虽然存在，但客户端不能完成恢复。
+          </p>
+        </div>
+
+        <div class="flow-lab">
+          <div class="scenario-switcher" role="tablist" aria-label="选择实现">
+            <button
+              class="scenario-button"
+              role="tab"
+              aria-selected="true"
+              data-scenario="original"
+              type="button"
+            >
+              原始 xLLM
+            </button>
+            <button
+              class="scenario-button"
+              role="tab"
+              aria-selected="false"
+              data-scenario="fixed"
+              type="button"
+            >
+              修复后 xLLM
+            </button>
+            <button
+              class="scenario-button"
+              role="tab"
+              aria-selected="false"
+              data-scenario="vllm"
+              type="button"
+            >
+              vLLM Store
+            </button>
+            <button
+              class="scenario-button"
+              role="tab"
+              aria-selected="false"
+              data-scenario="sglang"
+              type="button"
+            >
+              SGLang HiCache
+            </button>
+          </div>
+
+          <div class="storage-flow" aria-live="polite">
+            <article class="tier active" data-tier="hbm">
+              <div>
+                <div class="tier-icon">DEVICE TIER</div>
+                <h3>NPU / MLU HBM</h3>
+                <p>模型执行时真正使用的 KV Cache。</p>
+              </div>
+              <span class="status">设备内存</span>
+            </article>
+
+            <div class="arrow enabled" data-link="device-host" aria-label="HBM 与 Host 之间可传输">
+              <div class="arrow-line"></div>
+              <span class="arrow-label">设备复制</span>
+            </div>
+
+            <article class="tier active" data-tier="host">
+              <div>
+                <div class="tier-icon">XLLM LOCAL TIER</div>
+                <h3>Host KV Cache</h3>
+                <p>xLLM 与 Mooncake 之间的目标/来源缓冲区。</p>
+              </div>
+              <span class="status">主机内存</span>
+            </article>
+
+            <div class="arrow enabled" data-link="host-memory" aria-label="Host 与 Mooncake 内存之间可传输">
+              <div class="arrow-line"></div>
+              <span class="arrow-label">Store Get / Put</span>
+            </div>
+
+            <article class="tier active" data-tier="memory">
+              <div>
+                <div class="tier-icon">MOONCAKE REPLICA</div>
+                <h3>MEMORY</h3>
+                <p>Mooncake 分布式内存池中的可寻址副本。</p>
+              </div>
+              <span class="status">原本已支持</span>
+            </article>
+
+            <div class="arrow blocked" data-link="memory-disk" aria-label="原始 xLLM 无法从 SSD 恢复">
+              <div class="arrow-line"></div>
+              <span class="arrow-label">淘汰 / 回读</span>
+            </div>
+
+            <article class="tier blocked" data-tier="disk">
+              <div>
+                <div class="tier-icon">MOONCAKE REPLICA</div>
+                <h3>LOCAL_DISK</h3>
+                <p>Mooncake RealClient 所在节点的本地 SSD 文件副本。</p>
+              </div>
+              <span class="status" data-disk-status>存在，但读不回</span>
+            </article>
+          </div>
+
+          <div class="scenario-note">
+            <div>
+              <strong data-scenario-title>原始 xLLM：只能保证 MEMORY</strong>
+              <p data-scenario-description>
+                <span class="code">mooncake::Client::BatchGet</span>
+                能完成普通内存副本传输，但 LOCAL_DISK-only 时缺少 RealClient SSD 回读编排。
+              </p>
+            </div>
+            <span class="result-pill fail" data-result>SSD 恢复失败</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="shell" aria-labelledby="story-title">
+        <div class="section-head">
+          <div>
+            <div class="kicker">一块数据的故事</div>
+            <h2 id="story-title">KV Cache A 发生了什么？</h2>
+          </div>
+          <p>
+            “对象存在”和“能把对象恢复到 HBM”之间，隔着一条真实的数据路径。
+          </p>
+        </div>
+
+        <div class="story">
+          <article class="story-row">
+            <div class="time">T0</div>
+            <div>
+              <strong>写入 Mooncake</strong>
+              <p><span class="code">HBM → Host → MEMORY</span></p>
+            </div>
+            <div class="outcome">原始与修复后均成功</div>
+          </article>
+          <article class="story-row">
+            <div class="time">T1</div>
+            <div>
+              <strong>Mooncake 内存压力升高</strong>
+              <p>RealClient 把 A 落到 SSD，Master 记录一个 <span class="code">LOCAL_DISK</span> 副本。</p>
+            </div>
+            <div class="outcome">由 Mooncake 管理</div>
+          </article>
+          <article class="story-row">
+            <div class="time">T2</div>
+            <div>
+              <strong>MEMORY 副本被删除</strong>
+              <p>A 依然“存在”，但现在只存在于 SSD 文件中。</p>
+            </div>
+            <div class="outcome">BatchIsExist 仍可能命中</div>
+          </article>
+          <article class="story-row">
+            <div class="time">T3</div>
+            <div>
+              <strong>再次请求 A</strong>
+              <p>普通内存传输找不到源地址；RealClient 则会走 SSD offload RPC。</p>
+            </div>
+            <div class="outcome">这里决定能否恢复</div>
+          </article>
+          <article class="story-row">
+            <div class="time">T4</div>
+            <div>
+              <strong>修复后的完整恢复</strong>
+              <p><span class="code">SSD → RealClient staging → Host → HBM</span></p>
+            </div>
+            <div class="outcome">无需重新计算 KV</div>
+          </article>
+        </div>
+      </section>
+
+      <section id="comparison" class="shell" aria-labelledby="comparison-title">
+        <div class="section-head">
+          <div>
+            <div class="kicker">能力对比</div>
+            <h2 id="comparison-title">原本、修复后、其他框架</h2>
+          </div>
+          <p>
+            vLLM/SGLang 没有自己实现 SSD 文件系统；它们接入完整的
+            <span class="code">MooncakeDistributedStore / RealClient</span> 接口。
+          </p>
+        </div>
+
+        <div class="comparison">
+          <table>
+            <thead>
+              <tr>
+                <th>实现</th>
+                <th>Mooncake MEMORY</th>
+                <th>LOCAL_DISK-only 回读</th>
+                <th>关键接口</th>
+                <th>结论</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>原始 xLLM</td>
+                <td><span class="yes">● 支持读写</span></td>
+                <td><span class="no">● 不保证</span></td>
+                <td><span class="code">Client::BatchGet</span></td>
+                <td>内存副本消失后可能恢复失败</td>
+              </tr>
+              <tr>
+                <td>修复后 xLLM</td>
+                <td><span class="yes">● 支持读写</span></td>
+                <td><span class="yes">● 支持回读</span></td>
+                <td><span class="code">RealClient + batch_get_into_multi_buffers</span></td>
+                <td>MEMORY 与 LOCAL_DISK 均可恢复</td>
+              </tr>
+              <tr>
+                <td>vLLM</td>
+                <td><span class="yes">● 支持</span></td>
+                <td><span class="yes">● 支持</span></td>
+                <td><span class="code">MooncakeStoreConnector</span></td>
+                <td>统一 Store Get，Mooncake 内部分派</td>
+              </tr>
+              <tr>
+                <td>SGLang</td>
+                <td><span class="yes">● 支持</span></td>
+                <td><span class="yes">● 支持</span></td>
+                <td><span class="code">HiCache Mooncake backend</span></td>
+                <td>统一 Store Get，Mooncake 内部分派</td>
+              </tr>
+              <tr>
+                <td>Mooncake 旧 DISK / DFS</td>
+                <td>—</td>
+                <td><span class="partial">● 不属于本次范围</span></td>
+                <td>后端与配置相关</td>
+                <td>不能由 LOCAL_DISK 修复类推</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="shell" aria-labelledby="takeaway-title">
+        <div class="takeaway">
+          <div class="takeaway-main">
+            <div class="kicker">最终记忆点</div>
+            <h2 id="takeaway-title">“双向”描述方向；“闭环”描述覆盖的存储层。</h2>
+            <p>
+              原始 xLLM 的双向链路只覆盖 HBM、Host、Mooncake MEMORY。修复新增的是
+              LOCAL_DISK-only 的恢复闭环，而不是重新实现一个 SSD 管理器。
+            </p>
+          </div>
+          <aside class="takeaway-side">
+            <h3>生效前提</h3>
+            <ul>
+              <li>Mooncake Master 开启 SSD offload。</li>
+              <li>持有 SSD 的 RealClient 配置可写的本地路径。</li>
+              <li>客户端使用兼容版本和完整 Store/RealClient 回读接口。</li>
+              <li>NPU/MLU 的 Host ↔ HBM 搬运路径本身可用。</li>
+            </ul>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="shell footer-row">
+        <span>xLLM × Mooncake LOCAL_DISK explainer</span>
+        <span>单文件 · 无外部依赖 · 可离线打开</span>
+      </div>
+    </footer>
+
+    <script>
+      const scenarios = {
+        original: {
+          title: "原始 xLLM：只能保证 MEMORY",
+          description:
+            "mooncake::Client::BatchGet 能完成普通内存副本传输，但 LOCAL_DISK-only 时缺少 RealClient SSD 回读编排。",
+          result: "SSD 恢复失败",
+          success: false,
+          diskStatus: "存在，但读不回",
+        },
+        fixed: {
+          title: "修复后 xLLM：补齐 LOCAL_DISK 回读",
+          description:
+            "公共 KVCacheStore 接入 RealClient 等价路径；SSD 文件先被读入可传输缓冲区，再恢复到 Host 与设备 HBM。",
+          result: "SSD 恢复成功",
+          success: true,
+          diskStatus: "可通过 RealClient 回读",
+        },
+        vllm: {
+          title: "vLLM：MooncakeStoreConnector 已闭环",
+          description:
+            "vLLM 调用 MooncakeDistributedStore.batch_get_into_multi_buffers；MEMORY 与 LOCAL_DISK 的实际分派由 Mooncake 完成。",
+          result: "SSD 恢复成功",
+          success: true,
+          diskStatus: "统一 Store Get",
+        },
+        sglang: {
+          title: "SGLang：HiCache Mooncake backend 已闭环",
+          description:
+            "SGLang 调用 batch_get_into / batch_get_into_multi_buffers，并把 SSD offload 配置交给 Mooncake RealClient。",
+          result: "SSD 恢复成功",
+          success: true,
+          diskStatus: "统一 Store Get",
+        },
+      };
+
+      const buttons = document.querySelectorAll("[data-scenario]");
+      const diskTier = document.querySelector('[data-tier="disk"]');
+      const diskLink = document.querySelector('[data-link="memory-disk"]');
+      const title = document.querySelector("[data-scenario-title]");
+      const description = document.querySelector("[data-scenario-description]");
+      const result = document.querySelector("[data-result]");
+      const diskStatus = document.querySelector("[data-disk-status]");
+
+      function selectScenario(name) {
+        const scenario = scenarios[name];
+        if (!scenario) return;
+
+        buttons.forEach((button) => {
+          button.setAttribute(
+            "aria-selected",
+            String(button.dataset.scenario === name),
+          );
+        });
+
+        diskTier.classList.toggle("active", scenario.success);
+        diskTier.classList.toggle("blocked", !scenario.success);
+        diskLink.classList.toggle("enabled", scenario.success);
+        diskLink.classList.toggle("blocked", !scenario.success);
+        result.classList.toggle("fail", !scenario.success);
+        title.textContent = scenario.title;
+        description.textContent = scenario.description;
+        result.textContent = scenario.result;
+        diskStatus.textContent = scenario.diskStatus;
+      }
+
+      buttons.forEach((button) => {
+        button.addEventListener("click", () => {
+          selectScenario(button.dataset.scenario);
+        });
+      });
+    </script>
+  </body>
+</html>
